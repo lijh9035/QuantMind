@@ -13,6 +13,7 @@ import asyncio
 import logging
 import multiprocessing as mp
 import os
+import signal
 import sys
 from typing import Optional
 
@@ -661,8 +662,16 @@ def _ensure_stock_pool() -> None:
         logger.warning("全局股票池初始化失败（不影响启动）: %s", e)
 
 
+def _handle_sigterm(signum, _frame):
+    """Route Docker's SIGTERM through the supervisor cleanup path."""
+    raise KeyboardInterrupt(f"Received signal {signum}")
+
+
 def main():
     """主入口"""
+    # Linux PID 1 ignores the default SIGTERM disposition; let Docker stop use
+    # the same child-process cleanup as Ctrl-C instead of escalating to SIGKILL.
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     # 启动前确保数据库表结构完整
     _ensure_database_schema()
     # 启动期确保默认管理员账号存在（幂等，失败不影响启动）
