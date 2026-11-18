@@ -405,6 +405,7 @@ class AlphaAgentLauncher:
             direction=direction or "",
             seed_factors=seed_factors,
             llm_overrides=llm_overrides,
+            task_store=store,
         )
         try:
             if task.status == TaskStatus.COMPLETED:
@@ -581,7 +582,7 @@ class AlphaAgentLauncher:
                 await self._run_evolution(
                     task, loop_n=loop_n, seed=seed, provider_uri=provider_uri,
                     direction=direction, seed_factors=seed_factors,
-                    llm_overrides=llm_overrides,
+                    llm_overrides=llm_overrides, task_store=store,
                 )
                 while task.status == TaskStatus.STOPPING and task.process is not None:
                     task._cancel_confirmed = await self._terminate_process_group(task.process.pid)
@@ -870,6 +871,7 @@ class AlphaAgentLauncher:
         direction: str = "",
         seed_factors: list[dict[str, Any]] | None = None,
         llm_overrides: dict[str, str] | None = None,
+        task_store: Any | None = None,
     ) -> None:
         task.status = TaskStatus.RUNNING
         task.phase = "starting"
@@ -911,6 +913,8 @@ class AlphaAgentLauncher:
         logger.info("Command: %s", " ".join(cmd))
 
         stdout_log = task_log_dir / "subprocess_stdout.log"
+        local_progress_signature = None
+        database_progress_signature = None
 
         try:
             log_fh = open(stdout_log, "w")
@@ -934,7 +938,16 @@ class AlphaAgentLauncher:
                     if not task._cancel_confirmed:
                         logger.warning("Process group stop not confirmed for task %s", task.task_id)
                     break
-                self._update_progress(task, task_log_dir)
+                (
+                    local_progress_signature,
+                    database_progress_signature,
+                ) = await self._refresh_and_persist_progress(
+                    task,
+                    task_log_dir,
+                    task_store=task_store,
+                    local_signature=local_progress_signature,
+                    database_signature=database_progress_signature,
+                )
                 await asyncio.sleep(3)
 
             if process.poll() is None:
@@ -1113,6 +1126,58 @@ class AlphaAgentLauncher:
         # 构建详细时间线
         task.timeline = self._build_timeline(log_dir, task.loop_n)
         task.token_usage = self._aggregate_token_usage(log_dir)
+
+    async def _refresh_and_persist_progress(
+        self,
+        task: EvolutionTask,
+        log_dir: Path,
+        *,
+        task_store=None,
+        local_signature: tuple[str, str, int, int] | None = None,
+        database_signature: tuple[str, str, int, int] | None = None,
+    ) -> tuple[
+        tuple[str, str, int, int],
+        tuple[str, str, int, int] | None,
+    ]:
+        """Refresh local progress and persist changed snapshots to the task row."""
+        self._update_progress(task, log_dir)
+        signature = (
+            task.phase,
+            task.progress,
+            int(task.progress_pct),
+            int(task.current_loop),
+        )
+
+        if signature != local_signature:
+            self._persist_task(task)
+            local_signature = signature
+
+        if task_store is not None and signature != database_signature:
+            snapshot = {
+                "phase": task.phase,
+                "progress": task.progress,
+                "progress_pct": task.progress_pct,
+                "current_loop": task.current_loop,
+            }
+            try:
+                # The store only updates rows still marked running, so a concurrent
+                # cancel/stop transition remains authoritative.
+                await task_store.update_progress(
+                    task.task_id,
+                    tenant_id=task.tenant_id,
+                    user_id=task.user_id,
+                    snapshot=snapshot,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[factor-mining] DB进度回写失败 %s: %s",
+                    task.task_id,
+                    exc,
+                )
+            else:
+                database_signature = signature
+
+        return local_signature, database_signature
 
     _PHASE_DIR_MAP = {
         "hypothesis generation": ("hypothesis", "生成假设"),
