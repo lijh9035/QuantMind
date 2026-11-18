@@ -13,6 +13,10 @@ STATISTICAL_VERSION = "quantmind-statistical/2.0"
 PARAMETER_KEYS = frozenset(
     {
         "algorithm",
+        "batch_id",
+        "batch_size",
+        "batch_index",
+        "selection_batch_id",
         "market",
         "universe",
         "loop_n",
