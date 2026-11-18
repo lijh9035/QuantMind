@@ -228,6 +228,14 @@ class RDLoopWrapper:
             for k, v in env.items():
                 os.environ[k] = v
 
+            from .llm_env import allow_rdagent_none_reasoning_effort
+
+            if allow_rdagent_none_reasoning_effort(env):
+                logger.info(
+                    "[%s] Enabled Ollama reasoning_effort=none for Qwen 3.5 9B",
+                    self.market,
+                )
+
             # 确保 daily_pv.h5 数据文件可用
             self._ensure_data_file(task_log_dir)
 

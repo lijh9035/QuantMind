@@ -16,9 +16,60 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import urlsplit
 
 # docker-compose 占位符，视为未配置
 _PLACEHOLDER_KEYS = {"your-deepseek-api-key", "mock-api-key", "mock-api-key-not-configured"}
+_OLLAMA_QWEN35_MODEL = "qwen3.5:9b-q4_k_m"
+
+
+def _uses_local_ollama_qwen(env: dict[str, Any]) -> bool:
+    model = (
+        env.get("LITELLM_CHAT_MODEL", "").strip()
+        or env.get("CHAT_MODEL", "").strip()
+    ).lower()
+    if model.startswith("openai/"):
+        model = model[len("openai/") :]
+    if model != _OLLAMA_QWEN35_MODEL:
+        return False
+
+    base = (
+        env.get("LITELLM_OPENAI_API_BASE", "").strip()
+        or env.get("OPENAI_BASE_URL", "").strip()
+        or env.get("OPENAI_API_BASE", "").strip()
+    )
+    try:
+        parsed = urlsplit(base)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "http"
+        and parsed.hostname == "host.docker.internal"
+        and parsed.port == 11435
+        and parsed.path.rstrip("/") == "/v1"
+    )
+
+
+def allow_rdagent_none_reasoning_effort(env: dict[str, Any]) -> bool:
+    """Permit none before RD-Agent validates its local Ollama settings."""
+    if (
+        env.get("LITELLM_REASONING_EFFORT") != "none"
+        or not _uses_local_ollama_qwen(env)
+    ):
+        return False
+
+    from typing import Literal
+
+    from rdagent.oai.llm_conf import LLMSettings
+
+    field = LLMSettings.model_fields.get("reasoning_effort")
+    if field is None:
+        raise RuntimeError("RD-Agent has no reasoning_effort setting to extend")
+
+    field.annotation = Literal["low", "medium", "high", "none"] | None
+    if not LLMSettings.model_rebuild(force=True):
+        raise RuntimeError("Could not rebuild RD-Agent reasoning_effort setting")
+    return True
 
 
 def _is_placeholder(key: str) -> bool:
@@ -93,6 +144,9 @@ def build_llm_env(env: dict[str, Any]) -> dict[str, Any]:
         env["LITELLM_OPENAI_API_BASE"] = litellm_base
     if chat_model:
         env["LITELLM_CHAT_MODEL"] = chat_model
+    effort = str(env.get("LITELLM_REASONING_EFFORT", "")).strip()
+    if _uses_local_ollama_qwen(env) and not effort:
+        env["LITELLM_REASONING_EFFORT"] = "none"
 
     # ---- 写入标准 OPENAI_（litellm HTTP 层 + 兼容旧路径）----
     # 当用 deepseek 时，必须覆盖 OPENAI_API_KEY/BASE，否则 litellm 会用讯飞的 key 打 deepseek
