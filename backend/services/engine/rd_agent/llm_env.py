@@ -50,8 +50,44 @@ def _uses_local_ollama_qwen(env: dict[str, Any]) -> bool:
     )
 
 
+def _allow_local_ollama_reasoning_param(
+    env: dict[str, Any], completion_kwargs: dict[str, Any]
+) -> bool:
+    """Allow LiteLLM to pass the Qwen thinking switch to local Ollama."""
+    if (
+        env.get("LITELLM_REASONING_EFFORT") != "none"
+        or not _uses_local_ollama_qwen(env)
+        or completion_kwargs.get("reasoning_effort") != "none"
+    ):
+        return False
+
+    configured_model = (
+        env.get("LITELLM_CHAT_MODEL", "").strip()
+        or env.get("CHAT_MODEL", "").strip()
+    ).lower()
+    request_model = str(completion_kwargs.get("model", "")).strip().lower()
+    if configured_model.startswith("openai/"):
+        configured_model = configured_model[len("openai/") :]
+    if request_model.startswith("openai/"):
+        request_model = request_model[len("openai/") :]
+    if request_model != configured_model:
+        return False
+
+    allowed = completion_kwargs.get("allowed_openai_params")
+    if allowed is None:
+        allowed_params: list[str] = []
+    elif isinstance(allowed, str):
+        allowed_params = [allowed]
+    else:
+        allowed_params = list(allowed)
+    if "reasoning_effort" not in allowed_params:
+        allowed_params.append("reasoning_effort")
+    completion_kwargs["allowed_openai_params"] = allowed_params
+    return True
+
+
 def allow_rdagent_none_reasoning_effort(env: dict[str, Any]) -> bool:
-    """Permit none before RD-Agent validates its local Ollama settings."""
+    """Enable the local Qwen thinking switch in this RD-Agent process."""
     if (
         env.get("LITELLM_REASONING_EFFORT") != "none"
         or not _uses_local_ollama_qwen(env)
@@ -69,6 +105,25 @@ def allow_rdagent_none_reasoning_effort(env: dict[str, Any]) -> bool:
     field.annotation = Literal["low", "medium", "high", "none"] | None
     if not LLMSettings.model_rebuild(force=True):
         raise RuntimeError("Could not rebuild RD-Agent reasoning_effort setting")
+
+    from rdagent.oai.backend import litellm as rdagent_litellm
+
+    if not rdagent_litellm.LiteLLMSettings.model_rebuild(force=True):
+        raise RuntimeError("Could not rebuild LiteLLM reasoning_effort setting")
+    rdagent_litellm.LITELLM_SETTINGS = rdagent_litellm.LiteLLMSettings()
+
+    if not getattr(
+        rdagent_litellm, "_qm_local_qwen_reasoning_passthrough", False
+    ):
+        original_completion = rdagent_litellm.completion
+
+        def completion_with_local_qwen_reasoning(*args: Any, **kwargs: Any):
+            call_kwargs = dict(kwargs)
+            _allow_local_ollama_reasoning_param(dict(os.environ), call_kwargs)
+            return original_completion(*args, **call_kwargs)
+
+        rdagent_litellm.completion = completion_with_local_qwen_reasoning
+        rdagent_litellm._qm_local_qwen_reasoning_passthrough = True
     return True
 
 
