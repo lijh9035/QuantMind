@@ -527,6 +527,39 @@ class AuthService:
             last_login_at=user.last_login_at,
         )
 
+    async def login_local_single_user(
+        self,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+    ) -> TokenResponse:
+        """Create the standard JWT session for the seeded local admin account."""
+        if (
+            os.getenv("LOCAL_SINGLE_USER_MODE", "").strip().lower() != "true"
+            or os.getenv("LOCAL_SINGLE_USER_BIND_ADDRESS", "").strip() != "127.0.0.1"
+        ):
+            raise ValueError("Local single-user mode is not enabled")
+
+        async with get_session(read_only=True) as session:
+            result = await session.execute(
+                select(User).where(
+                    User.username == "admin",
+                    User.tenant_id == "default",
+                    User.is_deleted == False,
+                )
+            )
+            user = result.scalar_one_or_none()
+            if not user:
+                raise ValueError("Local admin account was not found")
+            if not user.is_active or user.is_locked or not user.is_admin:
+                raise ValueError("Local admin account is unavailable")
+
+            user_id = user.user_id
+            tenant_id = user.tenant_id
+
+        return await self._finalize_login(
+            user_id, tenant_id, ip_address, user_agent
+        )
+
     async def login(
         self,
         credentials: UserLogin,

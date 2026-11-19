@@ -2,6 +2,10 @@
 Authentication API Routes
 """
 
+import ipaddress
+import os
+from urllib.parse import urlsplit
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -29,8 +33,6 @@ from backend.services.api.user_app.services import (
 )
 from backend.services.api.user_app.services.user_service import UserService
 from backend.shared.database_manager_v2 import get_session
-
-
 from config.settings import settings
 
 class RefreshTokenRequest(BaseModel):
@@ -40,9 +42,77 @@ class RefreshTokenRequest(BaseModel):
 router = APIRouter(prefix="/auth")
 is_oss = settings.edition == "oss"
 
+
+def _local_single_user_mode_enabled() -> bool:
+    return (
+        os.getenv("LOCAL_SINGLE_USER_MODE", "").strip().lower() == "true"
+        and os.getenv("LOCAL_SINGLE_USER_BIND_ADDRESS", "").strip() == "127.0.0.1"
+    )
+
+
+def _is_loopback_hostname(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        parsed_host = urlsplit(f"//{value}")
+        hostname = parsed_host.hostname
+        if parsed_host.username is not None or parsed_host.password is not None:
+            return False
+        port = parsed_host.port  # Accessing port rejects malformed values.
+        if port is not None and not 0 <= port <= 65535:
+            return False
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_local_single_user_request(request: Request) -> bool:
+    if not _is_loopback_hostname(request.headers.get("host")):
+        return False
+
+    origin = request.headers.get("origin")
+    if not origin or origin.lower() in {"null", "file://"}:
+        return True
+    try:
+        parsed_origin = urlsplit(origin)
+    except ValueError:
+        return False
+    return (
+        parsed_origin.scheme in {"http", "https"}
+        and _is_loopback_hostname(parsed_origin.netloc)
+    )
+
+
 def get_auth_service() -> AuthService:
     """获取认证服务"""
     return AuthService()
+
+
+@router.post("/local-session", response_model=TokenResponse)
+async def create_local_single_user_session(
+    request: Request,
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    """Issue a real admin session only for an explicitly loopback-bound deployment."""
+    if not _local_single_user_mode_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    if not _is_local_single_user_request(request):
+        raise HTTPException(status_code=403, detail="Local access required")
+
+    try:
+        return await auth_service.login_local_single_user(
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)

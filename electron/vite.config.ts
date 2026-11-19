@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 
 // Web 部署使用相对路径，通过 Nginx 代理访问后端
@@ -13,6 +13,8 @@ const pkgVersion = JSON.parse(
 ).version as string;
 
 export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '');
+  const localSingleUserMode = env.VITE_LOCAL_SINGLE_USER_MODE?.toLowerCase() === 'true';
   const getPackageName = (id: string) => {
     const nodeModulesIndex = id.lastIndexOf('/node_modules/');
     if (nodeModulesIndex < 0) return null;
@@ -102,7 +104,7 @@ export default defineConfig(({ mode }) => {
     server: {
       port: parseInt(process.env.VITE_PORT || '3000'),
       strictPort: true,
-      host: '0.0.0.0', // 允许外部访问
+      host: localSingleUserMode ? '127.0.0.1' : '0.0.0.0', // keep the dev server loopback-only in local single-user mode
       proxy: {
         '/api': {
           target: process.env.VITE_API_URL || 'http://localhost:8000',

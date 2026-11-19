@@ -40,22 +40,20 @@ const UserCenterPage: React.FC = () => {
 
   // 获取认证用户信息（已由ProtectedRoute保证认证）
   const { user, isAuthenticated, isLoading: authLoading, isInitialized } = useAuth();
-  const isDev = (import.meta as any).env?.MODE === 'development';
-  const disabledAuth = isDev || String((import.meta as any).env?.VITE_DISABLE_AUTH || '').toLowerCase() === 'true';
 
   // 未登录或无用户ID时阻断渲染并跳转登录
   useEffect(() => {
-    if (!authLoading && !disabledAuth && (!isAuthenticated || (isInitialized && !user?.id && !localStorage.getItem('access_token')))) {
+    if (!authLoading && (!isAuthenticated || (isInitialized && !user?.id && !localStorage.getItem('access_token')))) {
       console.log('[UserCenter] Auth check failed or token cleared, redirecting to login');
       navigate('/auth/login', { replace: true, state: { from: location.pathname } });
     }
-  }, [authLoading, disabledAuth, isAuthenticated, user?.id, isInitialized, navigate, location.pathname]);
+  }, [authLoading, isAuthenticated, user?.id, isInitialized, navigate, location.pathname]);
 
   // 同步超时处理：防止由于 API 失败导致 Token 被清除却卡在“同步中”状态
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
     // 只有在已认证但没有用户信息时开启计时
-    if (isAuthenticated && !user?.id && !authLoading && !disabledAuth) {
+    if (isAuthenticated && !user?.id && !authLoading) {
       timer = setTimeout(() => {
         console.warn('[UserCenter] Sync profile timeout (10s)');
         setSyncTimeout(true);
@@ -64,7 +62,7 @@ const UserCenterPage: React.FC = () => {
     return () => {
       if (timer) clearTimeout(timer);
     };
-  }, [isAuthenticated, user?.id, authLoading, disabledAuth]);
+  }, [isAuthenticated, user?.id, authLoading]);
 
   // 处理退出登录
   const handleLogout = async () => {
@@ -103,7 +101,7 @@ const UserCenterPage: React.FC = () => {
   const effectiveUser = user || storedUser;
 
   // 如果已认证但用户信息尚未同步完成，展示加载中
-  if (isAuthenticated && !effectiveUser?.id && !disabledAuth) {
+  if (isAuthenticated && !effectiveUser?.id) {
     if (syncTimeout) {
       return (
         <div className="min-h-screen bg-[#f8fafc] p-4 flex items-center justify-center">
@@ -144,7 +142,7 @@ const UserCenterPage: React.FC = () => {
     );
   }
 
-  if (!disabledAuth && (!isAuthenticated || !effectiveUser?.id)) {
+  if ((!isAuthenticated || !effectiveUser?.id)) {
     return null;
   }
 

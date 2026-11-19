@@ -248,7 +248,11 @@ npm run check:platform
 ## WebSocket 调试开关
 
 - 设置 `VITE_DISABLE_WEBSOCKET=true` 可禁用全局 WebSocket 自动连接（用于调试登录问题）。
-- 登录页仅在 `VITE_DISABLE_AUTH=true` 时执行一次自动登录，避免默认开发模式下请求失败造成的持续报错。
+- 本地单用户自动登录默认关闭。仅在后端使用 `docker-compose.local-single-user.yml` 且前端设置 `VITE_LOCAL_SINGLE_USER_MODE=true` 时启用；Vite 开发服务器会绑定到 `127.0.0.1`。
+- 后端为现有 `default/admin` 账号创建标准 JWT 会话；前端仍通过 `/api/v1/users/me` 获取身份，并继续使用原权限体系。退出登录会撤销会话，下次启动时可重新建立。
+- 启用后端：`docker compose -f docker-compose.yml -f docker-compose.local-single-user.yml up -d quantmind`。如果本机存在 `docker-compose.override.yml`（例如配置了本地 Ollama），需将它放在基础文件之后、单用户文件之前。恢复普通登录时，移除单用户文件、取消前端开关或设为 `false`，再用基础 Compose 文件执行一次 `up -d quantmind`。
+- 桌面“QuantMind 本地前端”入口默认启动本地模式并打开 3001 端口；如需通过同一脚本启动普通登录，可执行时传入 `--normal`。
+- `VITE_DISABLE_AUTH` 不再关闭认证或创建模拟身份。旧的 `dev-admin-token` 会被清除，也无法通过后端认证。
 - Windows 圆角渲染修复：`platform-win32` 下禁用 Web 层 `html/body/#root/.app-root` 二次圆角裁剪，仅保留系统原生窗口圆角，避免登录页角落露出白底。
 - 启动体验优化：认证初始化阶段若本地无令牌（或当前在 `/auth/*` 公共路由）时，`App` 不再渲染 `DashboardSkeleton`，改为登录风格渐变 + `Spin` 启动态，减少启动时“蓝底闪屏”。
 - 首屏无 JS 兜底：`electron/index.html` 内联了启动渐变背景与轻量 loading，占位会在 React 挂载后自动被替换，避免 bundle 加载前出现纯色背景。

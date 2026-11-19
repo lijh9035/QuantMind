@@ -62,77 +62,112 @@ export const initializeAuth = createAsyncThunk(
   'auth/initialize',
   async () => {
     try {
-      // 检查本地存储的令牌
-      if (authService.isAuthenticated()) {
-        // 验证令牌是否有效
-        if (authService.isTokenExpired()) {
-          // 令牌过期，尝试刷新
-          const refreshToken = authService.getRefreshToken();
-          if (refreshToken) {
-            try {
-              const newToken = await Promise.race([
-                authService.refreshAuthToken(refreshToken),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('刷新Token超时')), 5000))
-              ]) as string;
-              localStorage.setItem('access_token', newToken);
-            } catch (error) {
-              console.error('刷新Token失败:', error);
-              authService.clearTokens();
-              return { user: null, token: null };
-            }
-          } else {
+      // Refresh an existing session first; invalid or missing sessions may use local mode.
+      if (authService.isAuthenticated() && authService.isTokenExpired()) {
+        const refreshToken = authService.getRefreshToken();
+        if (refreshToken) {
+          try {
+            const newToken = await Promise.race([
+              authService.refreshAuthToken(refreshToken),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Refresh token timeout')), 5000))
+            ]) as string;
+            localStorage.setItem('access_token', newToken);
+          } catch (error) {
+            console.error('Token refresh failed:', error);
             authService.clearTokens();
-            return { user: null, token: null };
           }
+        } else {
+          authService.clearTokens();
         }
+      }
 
-        // 获取当前用户信息（添加超时保护）
+      if (!authService.isAuthenticated() && authService.isLocalSingleUserMode()) {
         try {
-          const user = await Promise.race([
-            authService.getCurrentUser({ suppressUnauthorizedLog: true }),
-            new Promise<null>((_, reject) =>
-              setTimeout(() => reject(new Error('获取用户信息超时')), 5000)
-            )
+          await Promise.race([
+            authService.createLocalSingleUserSession(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Local session timeout')), 5000))
           ]);
-          const token = authService.getAccessToken();
-          if (!user) {
-            // token 已被 401/403 清掉 → 未登录；token 还在却拿不到用户 →
-            // 服务器不可达（getCurrentUser 网络失败返回 null 而非抛错），不得放行。
-            if (token) {
-              return { user: null, token: null, serverUnreachable: true };
-            }
-            return { user: null, token: null };
-          }
-
-          return {
-            user,
-            token,
-          };
         } catch (error) {
-          console.error('获取用户信息失败（含超时）:', error);
-          // 仅 401/403 清除 token（已在 getCurrentUser 内部处理）。
-          // 网络错误/超时 = 服务器不可达：绝不拿本地缓存冒充已登录，
-          // 打标后由路由层展示离线页，token 保留以便恢复后免登。
+          console.error('Local single-user session creation failed:', error);
+          authService.clearTokens();
           const status = (error as any)?.response?.status;
-          if (status === 401 || status === 403) {
-            authService.clearTokens();
-          } else {
+          if (!status || status >= 500) {
             return { user: null, token: null, serverUnreachable: true };
           }
           return { user: null, token: null };
         }
       }
-    } catch (error) {
-      console.error('初始化认证状态失败:', error);
-      authService.clearTokens();
-    }
 
-    return { user: null, token: null };
+      if (!authService.isAuthenticated()) {
+        return { user: null, token: null };
+      }
+
+      // The application accepts identity and permissions only from /users/me.
+      try {
+        const user = await Promise.race([
+          authService.getCurrentUser({ suppressUnauthorizedLog: true }),
+          new Promise<null>((_, reject) =>
+            setTimeout(() => reject(new Error('Current user request timeout')), 5000)
+          )
+        ]);
+        const token = authService.getAccessToken();
+        if (!user) {
+          if (token) {
+            return { user: null, token: null, serverUnreachable: true };
+          }
+
+          // A stored token may be well-formed but revoked. Retry once with a fresh
+          // local session only after /users/me rejected it and local mode is enabled.
+          if (authService.isLocalSingleUserMode()) {
+            try {
+              await Promise.race([
+                authService.createLocalSingleUserSession(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Local session timeout')), 5000))
+              ]);
+              const localUser = await Promise.race([
+                authService.getCurrentUser({ suppressUnauthorizedLog: true }),
+                new Promise<null>((_, reject) =>
+                  setTimeout(() => reject(new Error('Current user request timeout')), 5000)
+                )
+              ]);
+              const localToken = authService.getAccessToken();
+              if (localUser && localToken) {
+                return { user: localUser, token: localToken };
+              }
+              if (localToken) {
+                return { user: null, token: null, serverUnreachable: true };
+              }
+            } catch (error) {
+              console.error('Local session recovery failed:', error);
+              authService.clearTokens();
+              const status = (error as any)?.response?.status;
+              if (!status || status >= 500) {
+                return { user: null, token: null, serverUnreachable: true };
+              }
+            }
+          }
+          return { user: null, token: null };
+        }
+
+        return { user, token };
+      } catch (error) {
+        console.error('Current user initialization failed:', error);
+        const status = (error as any)?.response?.status;
+        if (status === 401 || status === 403) {
+          authService.clearTokens();
+          return { user: null, token: null };
+        }
+        return { user: null, token: null, serverUnreachable: true };
+      }
+    } catch (error) {
+      console.error('Authentication initialization failed:', error);
+      authService.clearTokens();
+      return { user: null, token: null };
+    }
   },
   {
     condition: (_, { getState }) => {
       const { auth } = getState() as { auth: AuthState };
-      // 如果已经初始化过，或正在加载中，则跳过
       if (auth.isInitialized || auth.isLoading) {
         return false;
       }
@@ -140,7 +175,6 @@ export const initializeAuth = createAsyncThunk(
     }
   }
 );
-
 // 用户登录
 export const login = createAsyncThunk(
   'auth/login',

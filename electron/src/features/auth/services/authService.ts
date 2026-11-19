@@ -33,14 +33,18 @@ class AuthService {
   );
   private readonly baseURL: string;
   private readonly apiPrefix: string;
-  private readonly disableAuth: boolean;
+  private readonly localSingleUserMode: boolean;
   private refreshRetryCount = 0;
   private readonly maxRefreshRetries = 2;
   private refreshRetryResetTimer: ReturnType<typeof setTimeout> | null = null;
   private refreshInFlight: Promise<string> | null = null;
 
+  isLocalSingleUserMode(): boolean {
+    return this.localSingleUserMode;
+  }
+
   constructor() {
-    this.disableAuth = String((import.meta as any).env?.VITE_DISABLE_AUTH || '').toLowerCase() === 'true';
+    this.localSingleUserMode = String((import.meta as any).env?.VITE_LOCAL_SINGLE_USER_MODE || '').toLowerCase() === 'true';
     const { baseURL, apiPrefix } = this.normalizeBaseURL(this.rawBaseURL);
     this.baseURL = baseURL;
     this.apiPrefix = apiPrefix;
@@ -58,33 +62,22 @@ class AuthService {
 
     this.setupInterceptors();
 
-    if (this.disableAuth) {
-      const existingUser = this.getStoredUser();
-      if (!existingUser) {
-        const now = new Date().toISOString();
-        const devAdmin = {
-          id: 1,
-          username: 'admin',
-          email: 'admin@example.com',
-          full_name: 'Administrator',
-          is_active: true,
-          is_admin: true,
-          created_at: now,
-          updated_at: now,
-        } as User;
-        localStorage.setItem('user', JSON.stringify(devAdmin));
-        localStorage.setItem('access_token', 'dev-admin-token');
-        localStorage.setItem('refresh_token', '');
-      }
-    }
   }
 
   /**
    * 规范化基础URL，分离域名和路径前缀
    */
   private normalizeBaseURL(url: string): { baseURL: string; apiPrefix: string } {
+    const normalizedUrl = url.trim();
+    // A web build uses the relative service base `/api/v1`. Preserve it as a
+    // request prefix so it still applies if the runtime later discovers an
+    // Electron server URL and switches the Axios base from relative to absolute.
+    if (normalizedUrl.startsWith('/')) {
+      return { baseURL: '', apiPrefix: normalizedUrl.replace(/\/$/, '') };
+    }
+
     try {
-      const parsed = new URL(url);
+      const parsed = new URL(normalizedUrl);
       let apiPrefix = parsed.pathname.replace(/\/$/, '');
       if (apiPrefix === '/') apiPrefix = '';
       parsed.pathname = '';
@@ -94,7 +87,7 @@ class AuthService {
       if (baseURL.endsWith('/')) baseURL = baseURL.slice(0, -1);
       return { baseURL, apiPrefix };
     } catch {
-      return { baseURL: url.replace(/\/$/, ''), apiPrefix: '' };
+      return { baseURL: normalizedUrl.replace(/\/$/, ''), apiPrefix: '' };
     }
   }
 
@@ -258,7 +251,6 @@ class AuthService {
     const skipAuthRefresh = !!config._skipAuthRefresh || isRefreshRequest;
 
     const shouldHandle401 =
-      !this.disableAuth &&
       error.response?.status === 401 &&
       !config._retry &&
       !skipAuthRefresh;
@@ -546,36 +538,40 @@ class AuthService {
   }
 
   /**
-   * 用户登录
+   * Create a real backend session for local single-user mode.
+   */
+  async createLocalSingleUserSession(): Promise<TokenResponse> {
+    if (!this.localSingleUserMode) {
+      throw new Error('Local single-user mode is not enabled');
+    }
+
+    try {
+      const response = await this.axiosInstance.post(
+        this.buildApiPath('/auth/local-session'),
+        {},
+        { _skipAuthRefresh: true, timeout: 4500 } as AuthRequestConfig,
+      );
+      const tokenData = this.normalizeTokenResponse(
+        this.unwrapResponse<TokenResponse | any>(response.data, 'Local session creation failed')
+      );
+      if (!tokenData.access_token || tokenData.access_token.split('.').length !== 3) {
+        throw new Error('The backend returned an invalid local session token');
+      }
+      localStorage.setItem('access_token', tokenData.access_token);
+      localStorage.setItem('refresh_token', tokenData.refresh_token);
+      localStorage.setItem('user', JSON.stringify(tokenData.user));
+      return tokenData;
+    } catch (error) {
+      throw this.handleError(error, 'local_single_user_login');
+    }
+  }
+
+  /**
+   * Sign in with the supplied account credentials.
    */
   async login(credentials: LoginCredentials): Promise<TokenResponse> {
     const startTime = Date.now();
     try {
-      if (this.disableAuth) {
-        const now = new Date().toISOString();
-        const devAdmin: User = {
-          id: 1,
-          username: 'admin',
-          email: 'admin@example.com',
-          full_name: 'Administrator',
-          is_active: true,
-          is_admin: true,
-          created_at: now,
-          updated_at: now,
-        };
-        const tokenData: TokenResponse = {
-          access_token: 'dev-admin-token',
-          refresh_token: '',
-          token_type: 'bearer',
-          expires_in: 7 * 24 * 60 * 60,
-          user: devAdmin,
-        };
-        localStorage.setItem('access_token', tokenData.access_token);
-        localStorage.setItem('refresh_token', tokenData.refresh_token);
-        localStorage.setItem('user', JSON.stringify(tokenData.user));
-        if (credentials.remember_me) localStorage.setItem('remember_login', 'true');
-        return tokenData;
-      }
       const tenantId = (credentials.tenant_id || this.getTenantId()).trim();
       const response = await this.postWithFallback(
         ['/auth/login', '/auth/token'],
@@ -638,10 +634,6 @@ class AuthService {
    */
   async logout(): Promise<void> {
     try {
-      if (this.disableAuth) {
-        this.clearTokens();
-        return;
-      }
       const token = localStorage.getItem('access_token');
       if (token) {
         await this.postWithFallback(
@@ -829,9 +821,6 @@ class AuthService {
   async getCurrentUser(options?: { suppressUnauthorizedLog?: boolean }): Promise<User | null> {
     const suppressUnauthorizedLog = options?.suppressUnauthorizedLog === true;
     try {
-      if (this.disableAuth) {
-        return this.getStoredUser();
-      }
       const token = this.getAccessToken();
       if (!token) {
         return null;
@@ -841,6 +830,7 @@ class AuthService {
           Authorization: `Bearer ${token}`,
         },
         _suppressAuthErrorLog: suppressUnauthorizedLog,
+        timeout: 4500,
       } as AuthRequestConfig);
 
       const userData = this.unwrapResponse<User>(response.data, '获取用户信息失败');
@@ -903,9 +893,6 @@ class AuthService {
    * 检查令牌是否过期
    */
   isTokenExpired(): boolean {
-    if (this.disableAuth) {
-      return false;
-    }
     const token = localStorage.getItem('access_token');
     if (!token) {
       return true;
@@ -928,10 +915,7 @@ class AuthService {
     if (!token) {
       return null;
     }
-    if (this.disableAuth) {
-      return token;
-    }
-    if (token === 'dev-admin-token' || token.split('.').length !== 3) {
+    if (token.split('.').length !== 3) {
       this.clearTokens();
       return null;
     }

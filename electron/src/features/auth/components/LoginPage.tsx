@@ -46,7 +46,6 @@ const LoginPage: React.FC = () => {
 
   const [loginError, setLoginError] = useState<string | null>(null);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
-  const autoLoginAttempted = useRef(false);
   // 后端不可达时展示整页内提示（配置保留，用户可检查服务器或稍后重试）
   const serverUnreachable = useAppSelector((state) => state.auth.serverUnreachable);
 
@@ -138,29 +137,6 @@ const LoginPage: React.FC = () => {
       navigate(from, { replace: true });
     }
   }, [isAuthenticated, navigate, location.state]);
-
-  useEffect(() => {
-    if (autoLoginAttempted.current) return;
-    const disabled =
-      String((import.meta as any).env?.VITE_DISABLE_AUTH || '').toLowerCase() === 'true';
-    if (!disabled) return;
-
-    autoLoginAttempted.current = true;
-    (async () => {
-      try {
-        if (!localStorage.getItem('user')) {
-          await handleLogin({
-            tenant_id: String((import.meta as any).env?.VITE_TENANT_ID || 'default'),
-            email_or_username: 'admin',
-            password: '',
-            remember_me: true,
-          } as LoginCredentials);
-        }
-      } catch {}
-      const from = (location.state as any)?.from?.pathname || '/';
-      navigate(from, { replace: true });
-    })();
-  }, [handleLogin, navigate, location.state]);
 
   // 初始化加载完成
   useEffect(() => {
