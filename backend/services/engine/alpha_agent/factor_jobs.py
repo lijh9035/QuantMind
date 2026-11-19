@@ -947,11 +947,19 @@ class AlphaFactorJobPersistence:
             )
             return dict(row) if row else None
 
-    async def claim_outbox(self, *, limit: int = 32) -> list[dict[str, Any]]:
-        """Lease a bounded batch of durable dispatch events for a publisher."""
+    async def claim_outbox(
+        self, *, limit: int = 32, kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Lease a bounded, optionally kind-scoped batch of durable events."""
         if not 1 <= limit <= 128:
             raise ValueError("Factor job dispatch batch is out of range")
+        if kind is not None and (not isinstance(kind, str) or not kind.strip()):
+            raise ValueError("Factor job dispatch kind is invalid")
         claimed: list[dict[str, str]] = []
+        kind_filter = " AND job.kind=:kind" if kind is not None else ""
+        params: dict[str, Any] = {"limit": limit}
+        if kind is not None:
+            params["kind"] = kind.strip()
         async with get_session() as session:
             rows = await session.execute(
                 text(
@@ -964,11 +972,13 @@ class AlphaFactorJobPersistence:
                     "AND lease.user_id=job.user_id "
                     "WHERE outbox.event_type='run_factor_job' AND job.status='queued' "
                     "AND lease.state='queued' AND outbox.available_at<=now() "
+                    + kind_filter
+                    + " "
                     "AND (outbox.claim_until IS NULL OR outbox.claim_until<now()) "
                     "ORDER BY outbox.available_at,outbox.created_at,outbox.job_id "
                     "FOR UPDATE OF outbox SKIP LOCKED LIMIT :limit"
                 ),
-                {"limit": limit},
+                params,
             )
             for row in rows.mappings().all():
                 token = uuid.uuid4().hex

@@ -33,7 +33,9 @@ def dispatch_factor_job_outbox() -> dict[str, int]:
         )
 
     jobs = AlphaFactorJobPersistence()
-    claimed = _run_async(jobs.claim_outbox(limit=32))
+    # This runner currently executes the materialization contract only. Keep
+    # other owner-scoped outbox kinds queued for their own executor.
+    claimed = _run_async(jobs.claim_outbox(limit=32, kind="materialize"))
     published = 0
     retried = 0
     for item in claimed:
@@ -105,6 +107,7 @@ def _run_factor_job(
     if record["status"] == "stopping" and record["kind"] not in {
         "doc_parse",
         "doc_organize",
+        "materialize",
     }:
         return {"job_id": job_id, "status": "stopping"}
 

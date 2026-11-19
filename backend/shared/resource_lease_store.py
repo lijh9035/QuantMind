@@ -1087,6 +1087,86 @@ class DurableLeaseStore:
             )
             return result.rowcount == 1
 
+    def record_container_intent(
+        self, pool, lease, *, intent, expected_dispatch_token=None
+    ):
+        """Persist exact Docker names and labels before a leased sandbox starts."""
+        if not isinstance(intent, dict) or not intent:
+            raise ValueError("Container intent must be a nonempty object")
+        if expected_dispatch_token is not None and (
+            not isinstance(expected_dispatch_token, str)
+            or not expected_dispatch_token
+            or len(expected_dispatch_token) > 128
+        ):
+            raise ValueError("Container intent dispatch fence is invalid")
+        encoded = json.dumps(
+            intent,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        if len(encoded.encode("utf-8")) > 32 * 1024:
+            raise ValueError("Container intent exceeds 32 KiB")
+        params = {
+            "pool": pool,
+            "task": lease.task_id,
+            "tenant": lease.tenant_id,
+            "user": lease.user_id,
+            "token": lease.token,
+            "epoch": lease.epoch,
+            "intent": encoded,
+        }
+        dispatch_filter = ""
+        if expected_dispatch_token is not None:
+            params["dispatch_token"] = expected_dispatch_token
+            dispatch_filter = " AND executor->>'dispatch_token'=:dispatch_token"
+        with self.session_factory() as session, session.begin():
+            self._lock(session, pool)
+            row = (
+                session.execute(
+                    text(
+                        "SELECT state,executor FROM resource_task_leases "
+                        "WHERE pool=:pool AND task_id=:task AND tenant_id=:tenant "
+                        "AND user_id=:user AND token=:token AND epoch=:epoch FOR UPDATE"
+                    ),
+                    params,
+                )
+                .mappings()
+                .first()
+            )
+            if not row or row["state"] != "running":
+                return False
+            executor = row["executor"] or {}
+            if executor.get("stop_requested"):
+                return False
+            engine_claim = executor.get("engine_claim_token")
+            if engine_claim and (
+                engine_claim != expected_dispatch_token
+                or executor.get("engine_request_state") != "active"
+            ):
+                return False
+            if (
+                expected_dispatch_token is not None
+                and executor.get("dispatch_token") != expected_dispatch_token
+            ):
+                return False
+            result = session.execute(
+                text(
+                    "UPDATE resource_task_leases SET "
+                    "executor=(COALESCE(executor,'{}'::jsonb)-'container_id') || "
+                    "CAST(:intent AS jsonb),updated_at=NOW(),heartbeat_at=NOW() "
+                    "WHERE pool=:pool AND task_id=:task AND tenant_id=:tenant "
+                    "AND user_id=:user AND token=:token AND epoch=:epoch "
+                    "AND state='running' "
+                    + dispatch_filter
+                    + " "
+                    "AND executor->>'stop_requested' IS DISTINCT FROM 'true'"
+                ),
+                params,
+            )
+            return result.rowcount == 1
+
     def finish_child_execution_request(self, pool, lease, child_id):
         """Mark a child handler finished so the reconciler can safely clean its resources."""
         params = {

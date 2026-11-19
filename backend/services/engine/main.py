@@ -527,6 +527,16 @@ except ImportError as e:
     logger.error(f"❌ Failed to load AlphaAgent routers: {e}")
 
 try:
+    from backend.services.engine.alpha_agent.factor_job_runner_api import (
+        router as factor_job_runner_router,
+    )
+
+    app.include_router(factor_job_runner_router)
+    logger.info("✅ Alpha factor job runner router loaded")
+except ImportError as e:
+    logger.error(f"❌ Failed to load Alpha factor job runner router: {e}")
+
+try:
     from backend.services.engine.routers.report_archive import router as report_archive_router
 
     app.include_router(report_archive_router)
