@@ -1346,20 +1346,27 @@ async def reconcile_local_storage(root: str | Path | None = None) -> None:
             .mappings()
             .all()
         )
-        report_rows = (
-            (
-                await session.execute(
-                    text(
-                        "SELECT tenant_id, user_id, report_id, "
-                        "octet_length(payload::text) AS size_bytes "
-                        "FROM public.qm_user_report_archive "
-                        "ORDER BY tenant_id, user_id, report_id"
+        report_archive_exists = (
+            await session.execute(
+                text("SELECT to_regclass('public.qm_user_report_archive') IS NOT NULL")
+            )
+        ).scalar_one()
+        report_rows = []
+        if report_archive_exists:
+            report_rows = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT tenant_id, user_id, report_id, "
+                            "octet_length(payload::text) AS size_bytes "
+                            "FROM public.qm_user_report_archive "
+                            "ORDER BY tenant_id, user_id, report_id"
+                        )
                     )
                 )
+                .mappings()
+                .all()
             )
-            .mappings()
-            .all()
-        )
         orphan_strategy = (
             await session.execute(
                 text(
