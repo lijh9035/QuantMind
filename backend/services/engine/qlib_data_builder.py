@@ -362,57 +362,56 @@ class QlibDataBuilder:
         return len(qlib_symbols)
 
     def _collect_raw_symbols(self) -> set[str]:
-        """收集原生 symbol 列表：优先 hub.fetch_stock_list，其次从行情 parquet 全量推导。
+        """收集有特征源行情的 symbol；行情分区是 Qlib instruments 的事实源。
 
-        额外补充 A 股指数（CN_QLIB_INDEX_SYMBOLS），让指数进入 instruments 与 features。
+        基础证券清单可能滞后于历史行情或指数成分；仅在行情分区不可用时才回退
+        到证券清单。额外补充 A 股指数（CN_QLIB_INDEX_SYMBOLS）。
         """
         symbols: set[str] = set()
 
-        # 1) 优先基础股票列表（如 2_base_sector/instrument_detail），记录是否取到真正的股票
-        stock_list_loaded = False
-        try:
-            df = self._hub.fetch_stock_list()
-            if df is not None and not df.empty:
-                symbol_col = None
-                for col in ("Symbol", "symbol", "instrument"):
-                    if col in df.columns:
-                        symbol_col = col
-                        break
-                if symbol_col:
-                    for sym in df[symbol_col].dropna().unique():
-                        qs = self._to_qlib_symbol(str(sym))
-                        if qs:
-                            symbols.add(qs)
-                    stock_list_loaded = len(symbols) > 0
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("%s fetch_stock_list 失败，改从行情 parquet 推导: %s", self._market, exc)
-
-        # 2) 基础列表缺失/为空时，从 daily_forward 行情分区全量推导（依赖 K 线，不受基础表缺失影响）
-        if not stock_list_loaded:
-            fwd = self._hub.data_dir / "1_kline_data" / "daily_forward"
-            if fwd.is_dir():
+        # 与 build_features_bulk 读取同一行情集，避免基础证券清单漏掉有历史行情的标的。
+        kline_sub = "daily_backward" if self._market == "CN" else "daily_forward"
+        kline_dir = self._hub.data_dir / "1_kline_data" / kline_sub
+        if kline_dir.is_dir():
+            try:
                 import duckdb
 
+                con = duckdb.connect(config={"memory_limit": "4GB", "threads": "2"})
                 try:
-                    con = duckdb.connect(config={"memory_limit": "4GB", "threads": "2"})
-                    try:
-                        df = con.execute(
-                            f"SELECT DISTINCT symbol FROM read_parquet('{fwd / 'dt=*' / 'data.parquet'}', hive_partitioning=1)"
-                        ).fetchdf()
-                    finally:
-                        con.close()
-                    for sym in df["symbol"].dropna().unique():
-                        qs = self._to_qlib_symbol(str(sym))
-                        if qs:
-                            symbols.add(qs)
-                    logger.info(
-                        "%s 基础股票列表缺失，已从行情 parquet 推导 %d 个标的",
-                        self._market, len(symbols),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("从 parquet 推导标的失败: %s", exc)
+                    df = con.execute(
+                        f"SELECT DISTINCT symbol FROM read_parquet('{kline_dir / 'dt=*' / 'data.parquet'}', hive_partitioning=1)"
+                    ).fetchdf()
+                finally:
+                    con.close()
+                for sym in df["symbol"].dropna().unique():
+                    qs = self._to_qlib_symbol(str(sym))
+                    if qs:
+                        symbols.add(qs)
+                logger.info(
+                    "%s 从 %s 行情分区推导 %d 个标的",
+                    self._market, kline_sub, len(symbols),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("从 %s 行情分区推导标的失败: %s", kline_sub, exc)
 
-        # 3) A 股额外纳入指定指数（无论走哪条路径都补充）
+        # 行情分区缺失/不可读时，回退到基础证券列表，保持空数据部署的旧行为。
+        if not symbols:
+            try:
+                df = self._hub.fetch_stock_list()
+                if df is not None and not df.empty:
+                    symbol_col = next(
+                        (c for c in ("Symbol", "symbol", "instrument") if c in df.columns),
+                        None,
+                    )
+                    if symbol_col:
+                        for sym in df[symbol_col].dropna().unique():
+                            qs = self._to_qlib_symbol(str(sym))
+                            if qs:
+                                symbols.add(qs)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("%s fetch_stock_list 失败: %s", self._market, exc)
+
+        # A 股额外纳入指定指数（无论走哪条路径都补充）
         if self._market == "CN":
             for idx_code in CN_QLIB_INDEX_SYMBOLS:
                 qs = self._to_qlib_symbol(idx_code)
@@ -426,25 +425,28 @@ class QlibDataBuilder:
     ) -> None:
         """为内置 A 股股票池生成 Qlib instruments 文件。
 
-        P2：池目录直读 shared.stock_pool.builtins（唯一事实源），
-        不再依赖 hub 上的 UNIVERSE_MAP 属性；只处理 CN 且有指数来源的池，
-        避免把 HK/US 池写进 A 股 qlib 缓存。
+        指数池以 QuantDB 权重表为准并受已有行情过滤；all_a 直接使用特征源行情，
+        这样能覆盖历史行情里仍有效、但基础证券清单未收录的标的。
         """
         from backend.shared.stock_pool.builtins import cn_index_symbols
 
         universes = cn_index_symbols()
+        index_symbols = {self._to_qlib_symbol(code) for code in CN_QLIB_INDEX_SYMBOLS}
         for universe in universes:
             try:
-                df = self._hub.fetch_universe_stocks(universe)
-                if df is None or df.empty or "symbol" not in df.columns:
-                    logger.warning("股票池 %s 无成分数据，跳过", universe)
-                    continue
-                syms = set()
-                for sym in df["symbol"].dropna().unique():
-                    qs = self._to_qlib_symbol(str(sym))
-                    # 只保留有行情数据的标的，否则 Qlib 读 features 时会报缺文件
-                    if qs and qs in known:
-                        syms.add(qs)
+                if universe == "all_a":
+                    syms = set(known) - index_symbols
+                else:
+                    df = self._hub.fetch_universe_stocks(universe)
+                    if df is None or df.empty or "symbol" not in df.columns:
+                        logger.warning("股票池 %s 无成分数据，跳过", universe)
+                        continue
+                    syms = set()
+                    for sym in df["symbol"].dropna().unique():
+                        qs = self._to_qlib_symbol(str(sym))
+                        # 只保留有行情数据的标的，否则 Qlib 读 features 时会报缺文件
+                        if qs and qs in known:
+                            syms.add(qs)
                 if not syms:
                     logger.warning("股票池 %s 成分与行情数据无交集，跳过", universe)
                     continue
