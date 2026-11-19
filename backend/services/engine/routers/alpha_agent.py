@@ -2793,7 +2793,11 @@ def _vectorized_daily_spearman_ic(
 
 
 def _resolve_instruments_for_universe(
-    market_upper: str, universe: str
+    market_upper: str,
+    universe: str,
+    *,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
 ) -> list[str] | str:
     """返回 Qlib instruments 选择。
 
@@ -2804,7 +2808,9 @@ def _resolve_instruments_for_universe(
     from qlib.data import D
 
     if market_upper == "CN":
-        custom = _resolve_custom_pool_instruments(universe)
+        custom = _resolve_custom_pool_instruments(
+            universe, tenant_id=tenant_id, user_id=user_id
+        )
         if custom is not None:
             return custom
         if universe in _QLIB_NATIVE_UNIVERSES:
