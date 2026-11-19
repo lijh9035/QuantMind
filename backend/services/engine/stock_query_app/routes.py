@@ -4,6 +4,8 @@
 """
 
 import logging
+import math
+from datetime import date, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -273,19 +275,95 @@ async def get_market_indices(
 
 @router.get("/market/overview")
 async def get_market_overview():
-    """获取市场概览"""
+    """获取本地 QuantDB 的真实市场概览（最近可用交易日）。"""
     logger.info("Fetching market overview")
 
     try:
-        query_service = get_query_service()
-        overview = query_service.get_market_overview()
+        from backend.services.engine.data_platform.quantdb_hub import QuantDBDataHub
 
-        logger.info("Market overview retrieved successfully")
+        hub = QuantDBDataHub.get_instance()
+        end = date.today()
+        start = end - timedelta(days=14)
+        index_meta = [
+            ("000001.SH", "上证指数"),
+            ("399001.SZ", "深证成指"),
+            ("000300.SH", "沪深300"),
+            ("000905.SH", "中证500"),
+            ("399006.SZ", "创业板指"),
+            ("000688.SH", "科创50"),
+            ("000016.SH", "上证50"),
+            ("899050.BJ", "北证50"),
+        ]
 
-        return overview
-    except Exception as e:
-        logger.error("Get market overview failed", extra={"error": str(e)})
-        raise HTTPException(status_code=500, detail=f"获取市场概览失败: {str(e)}")
+        def _number(value, default=0.0):
+            try:
+                result = float(value)
+                return result if math.isfinite(result) else default
+            except (TypeError, ValueError):
+                return default
+
+        indices = []
+        for symbol, name in index_meta:
+            try:
+                frame = hub.fetch_index_kline(symbol, start, end)
+                if frame is None or frame.empty:
+                    continue
+                frame = frame.sort_values("trade_date").reset_index(drop=True)
+                latest = frame.iloc[-1]
+                previous = frame.iloc[-2] if len(frame) >= 2 else None
+
+                price = _number(latest.get("close"))
+                if price <= 0:
+                    continue
+                previous_close = _number(previous.get("close")) if previous is not None else 0.0
+                if previous_close <= 0:
+                    previous_close = _number(latest.get("open"), price) or price
+                change = price - previous_close
+                trade_date = str(latest.get("trade_date") or "")[:10]
+
+                indices.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "price": round(price, 4),
+                    "change": round(change, 4),
+                    "change_percent": round(change / previous_close * 100, 4) if previous_close else 0.0,
+                    "open": round(_number(latest.get("open")), 4),
+                    "high": round(_number(latest.get("high")), 4),
+                    "low": round(_number(latest.get("low")), 4),
+                    "pre_close": round(previous_close, 4),
+                    "volume": _number(latest.get("volume")),
+                    "amount": _number(latest.get("amount")),
+                    "trade_date": trade_date,
+                })
+            except Exception as index_error:
+                logger.warning(
+                    "Skipping unavailable market index",
+                    extra={"symbol": symbol, "error": str(index_error)},
+                )
+
+        if not indices:
+            return {
+                "success": False,
+                "data": {"market": "CN", "indices": [], "last_update": "", "source_used": "local_quantdb"},
+                "error": "CN 市场暂无可用的本地指数行情",
+            }
+
+        up = sum(1 for item in indices if item["change_percent"] > 0)
+        down = sum(1 for item in indices if item["change_percent"] < 0)
+        return {
+            "success": True,
+            "data": {
+                "market": "CN",
+                "indices": indices,
+                "last_update": max(item["trade_date"] for item in indices if item["trade_date"]),
+                "stats": {"up": up, "down": down, "flat": len(indices) - up - down, "total": len(indices)},
+                "source_used": "local_quantdb",
+            },
+        }
+    except Exception as exc:
+        logger.error("Get market overview failed", extra={"error": str(exc)})
+        raise HTTPException(status_code=500, detail=f"获取市场概览失败: {str(exc)}")
+
 
 
 """
