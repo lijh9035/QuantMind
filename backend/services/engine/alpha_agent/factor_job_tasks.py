@@ -150,7 +150,7 @@ def _run_factor_job(
         logger.critical("[factor-job] internal engine secret is unavailable")
         raise self.retry(countdown=60)
     engine_url = (
-        engine_url or os.getenv("ENGINE_SERVICE_URL", "http://quantmind-engine:8001")
+        engine_url or os.getenv("ENGINE_SERVICE_URL", "http://quantmind:8001")
     ).rstrip("/")
     headers = {
         "X-Internal-Call": secret,
