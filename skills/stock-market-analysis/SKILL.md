@@ -30,14 +30,25 @@ description: "股票市场深度数据分析与导出 — 全市场信号扫描�
 
 ## 认证
 
-```bash
-BASE=http://127.0.0.1:8000
-TOKEN=$(curl -s -X POST $BASE/api/v1/auth/login -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin123","tenant_id":"default"}' \
-  | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))")
-AUTH="Authorization: Bearer $TOKEN"
-CT="Content-Type: application/json"
-```
+### QuantBot / QwenPaw
+
+BASE 指向 API Gateway；Gateway 请求只能使用已有用户正常登录签发的真实 JWT。若容器里没有 JWT，停止/跳过所有 BASE 请求，不得在技能中登录、注册或伪造 Token。Gateway 会剥离客户端提供的 X-Internal-Call，不要把内部调用头发给 BASE。
+
+    BASE="${QUANTMIND_API_BASE_URL:-http://quantmind:8000}"
+    ENGINE_BASE="${QUANTMIND_ENGINE_URL:-http://quantmind:8001}"
+    AUTH=""
+    if [ -n "${QUANTMIND_USER_JWT:-}" ]; then
+      AUTH="Authorization: Bearer $QUANTMIND_USER_JWT"
+    else
+      echo "没有现成用户 JWT；停止/跳过所有网关 BASE 请求，不要登录或注册。"
+    fi
+    : "${INTERNAL_CALL_SECRET:?QwenPaw 未注入 INTERNAL_CALL_SECRET}"
+    INTERNAL_CALL_HEADER="X-Internal-Call: $INTERNAL_CALL_SECRET"
+    CT="Content-Type: application/json"
+
+所有 BASE 示例使用真实 -H "$AUTH"。宿主机维护者只能把已有用户 JWT 提供给 QUANTMIND_USER_JWT；不得在技能文本中保存账号密码或 JWT。
+
+QwenPaw 可通过 ENGINE_BASE 直连 Engine 服务。仅全局只读接口可使用 INTERNAL_CALL_HEADER；用户范围接口必须使用真实用户 JWT，不能用 Compose 中的 QUANTMIND_USER_ID=qwenpaw 冒充数据库用户。不要把内部调用头发送到 BASE。
 
 ## 1. 全市场信号扫描（选股）
 
@@ -112,7 +123,7 @@ curl -s -H "$AUTH" "$BASE/api/v1/models/inference/stock/600519.SH/history?days=1
 # ⑤ 大盘环境（L0，先于一切）
 curl -s -H "$AUTH" "$BASE/api/v1/selection/daily"           # market_state 牛熊+仓位建议
 curl -s -H "$AUTH" "$BASE/api/v1/market/index-kline?symbol=000001.SH&days=60"
-curl -s -H "$AUTH" "$BASE/api/v1/market/overview"           # 多市场指数概览
+curl -fsS -H "X-Internal-Call: ${INTERNAL_CALL_SECRET:?missing INTERNAL_CALL_SECRET}" "${QUANTMIND_ENGINE_URL:-http://quantmind:8001}/api/v1/market/overview"           # Engine 内部直连只读接口，不依赖用户行
 
 # ⑥ 订单微结构截面分位（L4b，2026-08 新增；先确认最新分区）
 docker exec quantmind ls /data/quantdb/6_ml_datasets/l1_l2_factors/ | tail -1   # → dt=YYYYMMDD

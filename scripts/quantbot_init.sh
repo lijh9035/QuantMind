@@ -51,8 +51,8 @@ install_skills() {
   log "==> 技能安装 [$QWENPAW_BASE_URL]"
 
   # 健康检查
-  if ! curl -sf -o /dev/null "$QWENPAW_BASE_URL/health"; then
-    die "QwenPaw 不可达: $QWENPAW_BASE_URL/health"
+  if ! curl -sf -o /dev/null "$QWENPAW_BASE_URL/api/healthz"; then
+    die "QwenPaw 不可达: $QWENPAW_BASE_URL/api/healthz"
   fi
 
   # 1.1 打包本地技能（每个技能目录必须含 SKILL.md，zip 根为技能目录）
