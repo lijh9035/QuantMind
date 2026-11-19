@@ -662,6 +662,21 @@ def _ensure_stock_pool() -> None:
         logger.warning("全局股票池初始化失败（不影响启动）: %s", e)
 
 
+def _reconcile_storage_quota() -> None:
+    """Rebuild the durable quota ledger before services accept file writes."""
+    try:
+        from backend.shared.storage_quota_ledger import reconcile_local_storage
+
+        asyncio.run(reconcile_local_storage())
+        logger.info("本地存储配额账本对账完成")
+    except Exception as exc:  # noqa: BLE001
+        # Keep storage_quota_state.ready closed when inventory or persistence fails.
+        logger.exception(
+            "本地存储配额账本对账失败，文件写入保持关闭 (%s)",
+            type(exc).__name__,
+        )
+
+
 def _handle_sigterm(signum, _frame):
     """Route Docker's SIGTERM through the supervisor cleanup path."""
     raise KeyboardInterrupt(f"Received signal {signum}")
@@ -679,6 +694,7 @@ def main():
     # 启动期确保全局股票池表结构与内置池 seed（幂等，失败不影响启动）
     _ensure_stock_pool()
 
+    _reconcile_storage_quota()
     service_mode = os.getenv("SERVICE_MODE", "all").lower().strip()
     ports = get_service_ports()
     workers_config = get_workers_config()
