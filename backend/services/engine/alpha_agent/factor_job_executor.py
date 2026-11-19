@@ -511,7 +511,7 @@ def execute_factor_materialization(
     should_cancel: Callable[[], bool] | None = None,
     panel_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Compute a saved Factor class into one private, quota-managed generation."""
+    """Compute a saved factor into one private, quota-managed generation."""
     if not isinstance(request, dict):
         raise ValueError("Factor materialization snapshot is invalid")
     source_snapshot = request.get("source_data_snapshot")
@@ -540,7 +540,7 @@ def execute_factor_materialization(
         or type(factor_revision_no) is not int
         or factor_revision_no < 1
         or request.get("factor_kind")
-        not in {"factor_class", "functional", "qlib_expression"}
+        not in {"factor_class", "functional", "qlib_expression", "factor_miner"}
         or not isinstance(expected_hash, str)
         or hashlib.sha256(factor_code.encode("utf-8")).hexdigest() != expected_hash
     ):
@@ -557,7 +557,13 @@ def execute_factor_materialization(
 
     factor_kind = request["factor_kind"]
     candidate = None
-    if factor_kind == "qlib_expression":
+    if factor_kind == "factor_miner":
+        if not factor_code.startswith("fm:"):
+            raise ValueError("FactorMiner materialization requires an fm: expression")
+        from backend.services.engine.alpha_agent.factorminer.dsl import parse
+
+        parse(factor_code[3:])
+    elif factor_kind == "qlib_expression":
         from backend.services.engine.alpha_agent.statistical.materialization import (
             trusted_statistical_candidate,
         )
@@ -670,6 +676,75 @@ def execute_factor_materialization(
                 should_cancel=should_cancel,
             )
         )
+    elif factor_kind == "factor_miner":
+        from backend.services.engine.alpha_agent.factorminer.dsl import (
+            min_history,
+            parse,
+        )
+        from backend.services.engine.alpha_agent.factorminer.runtime import (
+            evaluate_window,
+        )
+        from backend.services.engine.alpha_agent.materialization_window import (
+            materialization_date_chunks,
+        )
+        from qlib.data import D
+
+        warmup_bars = min_history(parse(factor_code[3:]))
+        calendar = pd.DatetimeIndex(
+            D.calendar(start_time=start, end_time=end, freq="day")
+        )
+        if calendar.empty:
+            raise RuntimeError(
+                "Qlib returned an empty FactorMiner materialization calendar"
+            )
+        expected_materialization_dates = calendar.strftime("%Y-%m-%d").tolist()
+        chunks = materialization_date_chunks(
+            start, end, max(len(instruments), 1), warmup_bars
+        )
+        pieces = []
+        progress({"stage": "factor_eval", "progress_pct": 35})
+        qlib_dir = str(resolve_qlib_provider_uri("CN"))
+        for chunk_index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+            if should_cancel is not None and should_cancel():
+                raise FactorMaterializationCancelled(
+                    "Factor materialization was cancelled"
+                )
+            series = evaluate_window(
+                factor_code,
+                instruments=instruments,
+                start=chunk_start,
+                end=chunk_end,
+                qlib_dir=qlib_dir,
+            )
+            dates = pd.to_datetime(series.index.get_level_values("trade_date"))
+            symbols = series.index.get_level_values("symbol").map(
+                StockCodeUtil.to_suffix
+            )
+            pieces.append(
+                pd.DataFrame(
+                    {
+                        "symbol": symbols,
+                        "trade_date": dates.strftime("%Y-%m-%d"),
+                        "value": pd.to_numeric(series.to_numpy(), errors="coerce"),
+                    }
+                )
+            )
+            progress(
+                {
+                    "stage": "factor_eval",
+                    "progress_pct": 35 + int(3 * chunk_index / max(len(chunks), 1)),
+                }
+            )
+        output = (
+            pd.concat(pieces, ignore_index=True)
+            if pieces
+            else pd.DataFrame(columns=["symbol", "trade_date", "value"])
+        )
+        input_evidence_snapshot = {
+            "price_source": "qlib_bin",
+            "scope": "factor_miner_materialization",
+            "warmup_bars": warmup_bars,
+        }
     elif factor_kind == "qlib_expression":
         progress({"stage": "factor_eval", "progress_pct": 35})
         if use_statistical_panel:

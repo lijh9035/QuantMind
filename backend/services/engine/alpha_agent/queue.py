@@ -90,6 +90,26 @@ async def recover_executions():
                 "user_id": execution["user_id"],
             }
             task_id = execution["task_id"]
+            if executor.get("alphasage_worker"):
+                from backend.services.engine.alpha_agent.alphasage.worker import (
+                    recover_orphaned_execution,
+                )
+                from backend.shared.owner_scope import OwnerScope
+
+                recovered = await recover_orphaned_execution(
+                    store,
+                    task_id,
+                    OwnerScope(owner["tenant_id"], owner["user_id"]),
+                )
+                if recovered:
+                    logger.warning(
+                        "Recovered orphaned AlphaSAGE GPU task %s (%s)",
+                        task_id,
+                        recovered,
+                    )
+                # A nonterminal response or network error retains the durable
+                # execution lease; a later dispatcher cycle retries DELETE.
+                continue
             if executor.get("rdagent_child"):
                 # A remote parent exiting does not prove its separately hosted
                 # sandbox ended. Stop the child before releasing the parent slot.
@@ -147,7 +167,31 @@ async def _execute(launcher, row):
     task_id = row["task_id"]
     interrupted = True
     try:
-        await launcher.run_queued(row)
+        if row.get("algorithm") == "alphasage":
+            # Cancelling the engine coroutine must not drop its local lease
+            # while the detached GPU worker may still be running. Let the
+            # adapter observe an owner-scoped stop request, issue DELETE, and
+            # confirm the worker's terminal state before this task unwinds.
+            execution = asyncio.create_task(launcher.run_queued(row))
+            stop_requested = False
+            while True:
+                try:
+                    await asyncio.shield(execution)
+                    break
+                except asyncio.CancelledError:
+                    if not stop_requested:
+                        stop_requested = True
+                        try:
+                            await store.request_cancel(task_id, **owner)
+                        except Exception:
+                            logger.exception(
+                                "Could not persist AlphaSAGE stop request for %s; "
+                                "waiting for the worker adapter",
+                                task_id,
+                            )
+                    continue
+        else:
+            await launcher.run_queued(row)
         interrupted = False
     finally:
         budget = get_budget()
@@ -235,11 +279,17 @@ async def run_queue():
                     )
                     if queued:
                         item = queued[0]
-                        row = await store.get(
-                            item["task_id"],
-                            tenant_id=item["tenant_id"],
-                            user_id=item["user_id"],
-                        )
+                        # The dispatcher needs the immutable algorithm/spec as
+                        # well as the task row; the bare row defaults every
+                        # durable task to RD-Agent in launcher.run_queued.
+                        row = await store.get_for_dispatch(item["task_id"])
+                        if row and (
+                            row.get("tenant_id") != item["tenant_id"]
+                            or row.get("user_id") != item["user_id"]
+                        ):
+                            raise ValueError(
+                                "Queued task owner does not match its durable lease"
+                            )
                         if row and row["status"] in {"pending", "queued"}:
                             # OSS-ADAPT: OSS 单容器不支持远端挖掘节点
                             # (celery-worker-factor-remote)，固定本地执行。

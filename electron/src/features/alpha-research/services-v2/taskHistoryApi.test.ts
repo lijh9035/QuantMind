@@ -87,6 +87,28 @@ describe('task history API', () => {
     );
   });
 
+  it('reads AlphaSAGE candidates and persisted validated factors from task history', async () => {
+    const controller = new AbortController();
+    const result = {
+      task_id: 'task-alpha',
+      algorithm: 'alphasage',
+      status: 'completed',
+      result: {
+        candidate_count: 2,
+        training_window: { requested_start: '2019-01-01', requested_end: '2022-12-30', mature_label_end: '2022-12-23', horizon: 5 },
+        validation_window: { start: '2023-01-03', end: '2023-12-29', evaluated: true },
+      },
+      factors: [{ factor_id: 'factor-1', factor_name: 'AlphaSAGE 候选', factor_formulation: 'Mean($close, 5)', status: 'active', rank_ic: 0.04, factor_revision_no: 1 }],
+    };
+    client.get.mockResolvedValue({ data: { data: result } });
+
+    await expect(getTaskMiningResult('task-alpha', controller.signal)).resolves.toMatchObject({
+      algorithm: 'alphasage',
+      result: { candidate_count: 2, validation_window: { evaluated: true } },
+      factors: [{ factor_id: 'factor-1' }],
+    });
+  });
+
   it('reads the bounded RD-Agent trajectory with an encoded task ID', async () => {
     const controller = new AbortController();
     const trajectory = { task_id: 'task/1', loops: [], attribution: 'workspace_metadata_only' };

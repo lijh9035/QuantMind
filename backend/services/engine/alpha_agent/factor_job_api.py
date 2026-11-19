@@ -169,6 +169,32 @@ def _factor_revision_no(factor: dict) -> int:
     return revision_no
 
 
+def _log_materialization_admission_failure(exc: Exception) -> None:
+    """Log the failure site and class without emitting exception text or values."""
+    driver_error = getattr(exc, "orig", None)
+    sqlstate = (
+        getattr(exc, "sqlstate", None)
+        or getattr(exc, "pgcode", None)
+        or getattr(driver_error, "sqlstate", None)
+        or getattr(driver_error, "pgcode", None)
+    )
+    if (
+        not isinstance(sqlstate, str)
+        or len(sqlstate) != 5
+        or not sqlstate.isalnum()
+    ):
+        sqlstate = "unknown"
+    # Keep the original traceback frames for diagnosis but replace the exception
+    # value before formatting; DB messages can contain bound values or local paths.
+    safe_exception = RuntimeError("exception details redacted")
+    logger.exception(
+        "Factor materialization admission failed exception_type=%s sqlstate=%s",
+        type(exc).__name__,
+        sqlstate,
+        exc_info=(type(exc), safe_exception, exc.__traceback__),
+    )
+
+
 def _report_cell(value: object) -> str:
     return (
         str(value or "")
@@ -603,11 +629,19 @@ async def submit_factor_materialization(
     statistical_snapshot: dict[str, str] = {}
     try:
         metadata = factor.get("metadata") or {}
-        from backend.services.engine.alpha_agent.statistical.materialization import (
-            trusted_statistical_candidate,
-        )
+        if factor_code.startswith("fm:"):
+            from backend.services.engine.alpha_agent.factorminer.dsl import parse
 
-        candidate = trusted_statistical_candidate(metadata, factor_code)
+            parse(factor_code[3:])
+            candidate = None
+            factor_kind = "factor_miner"
+            candidate_key = None
+        else:
+            from backend.services.engine.alpha_agent.statistical.materialization import (
+                trusted_statistical_candidate,
+            )
+
+            candidate = trusted_statistical_candidate(metadata, factor_code)
         if candidate is not None:
             factor_kind = "qlib_expression"
             candidate_key = candidate.key
@@ -670,15 +704,23 @@ async def submit_factor_materialization(
             }
         else:
             try:
-                factor_kind = alpha_router._detect_factor_kind(factor_code)
+                factor_kind = _factor_job_kind(factor_code, alpha_router)
             except RuntimeError as exc:
                 raise ValueError(
-                    f"Only Factor class, calculate_* or trusted statistical factors can be materialized ({exc})"
+                    "Only FactorMiner expressions, Factor classes, calculate_* "
+                    f"or trusted statistical factors can be materialized ({exc})"
                 ) from exc
-            candidate_key = None
-        if factor_kind not in {"factor_class", "functional", "qlib_expression"}:
+            if factor_kind != "factor_miner":
+                candidate_key = None
+        if factor_kind not in {
+            "factor_class",
+            "functional",
+            "qlib_expression",
+            "factor_miner",
+        }:
             raise ValueError(
-                "Only Factor class, calculate_* or trusted statistical factors can be materialized"
+                "Only FactorMiner expressions, Factor classes, calculate_* or "
+                "trusted statistical factors can be materialized"
             )
         start = _request_date(payload.start_date, "start_date")
         end = _request_date(payload.end_date, "end_date")
@@ -726,7 +768,9 @@ async def submit_factor_materialization(
         "factor_code_sha256": hashlib.sha256(factor_code.encode("utf-8")).hexdigest(),
         "factor_revision_no": factor_revision_no,
         "factor_kind": factor_kind,
-        "price_source": "quantdb_daily_forward",
+        "price_source": "qlib_bin"
+        if factor_kind == "factor_miner"
+        else "quantdb_daily_forward",
         "statistical_candidate_key": candidate_key,
         "statistical_evidence": metadata.get("evidence")
         if candidate is not None
@@ -748,7 +792,14 @@ async def submit_factor_materialization(
         )
 
         warmup_bars = int(candidate.min_history) if candidate is not None else 0
-        if candidate is None and factor_kind == "functional":
+        if candidate is None and factor_kind == "factor_miner":
+            from backend.services.engine.alpha_agent.factorminer.dsl import (
+                min_history,
+                parse,
+            )
+
+            warmup_bars = min_history(parse(factor_code[3:]))
+        elif candidate is None and factor_kind == "functional":
             warmup_bars = infer_functional_warmup(factor_code)
         elif candidate is None and factor_kind == "factor_class":
             from backend.services.engine.alpha_agent.factor_codegen import (
@@ -802,6 +853,7 @@ async def submit_factor_materialization(
     except FactorJobQueueFull as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except Exception as exc:
+        _log_materialization_admission_failure(exc)
         raise HTTPException(
             status_code=503, detail="Factor materialization admission failed"
         ) from exc

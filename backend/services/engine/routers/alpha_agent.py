@@ -4,8 +4,10 @@
 """
 
 import asyncio
+import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -14,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -63,6 +65,10 @@ persistence = RDAgentFactorPersistence()
 # P2：CN 可选股票池由 shared.stock_pool.builtins 派生（唯一事实源），
 # 与 quantdb_hub.UNIVERSE_MAP / Strategy Lab 白名单同源，不再各写一份。
 _VALID_CN_UNIVERSES: list[str] = list(cn_index_symbols().keys())
+_ALPHASAGE_QILIB_INSTRUMENTS = frozenset(
+    {"all", "all_a", "csi300", "csi500", "csi800", "csi1000", "sse50", "gem", "star"}
+)
+_ALPHASAGE_SYMBOL_RE = re.compile(r"(?:sh|sz|bj)[0-9]{6}\Z")
 
 
 def _normalize_pool_ref(universe: str) -> str:
@@ -74,27 +80,54 @@ def _normalize_pool_ref(universe: str) -> str:
     return f"pool:{u}"
 
 
-def _universe_is_valid(universe: str) -> bool:
+def _pool_owner_kwargs(
+    tenant_id: str | None, user_id: str | None
+) -> dict[str, str]:
+    if (tenant_id is None) != (user_id is None):
+        raise ValueError("Both owner dimensions are required to resolve a private pool")
+    if tenant_id is None or user_id is None:
+        return {}
+    from backend.shared.owner_scope import OwnerScope
+
+    return OwnerScope(tenant_id, user_id).sql_params()
+
+
+def _universe_is_valid(
+    universe: str,
+    *,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+) -> bool:
+    try:
+        owner_kwargs = _pool_owner_kwargs(tenant_id, user_id)
+    except ValueError:
+        return False
     if universe in _VALID_CN_UNIVERSES:
         return True
     try:
         from backend.shared.stock_pool.resolver import resolve_pool_sync
 
-        snap = resolve_pool_sync(_normalize_pool_ref(universe))
+        snap = resolve_pool_sync(_normalize_pool_ref(universe), **owner_kwargs)
         return bool(snap.unfiltered or snap.symbols)
     except Exception:
         return False
 
 
-def _resolve_custom_pool_instruments(universe: str) -> list[str] | None:
+def _resolve_custom_pool_instruments(
+    universe: str,
+    *,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+) -> list[str] | None:
     """非内置 code 时尝试全局股票池解析；内置池返回 None 走原逻辑。"""
+    owner_kwargs = _pool_owner_kwargs(tenant_id, user_id)
     if universe in _VALID_CN_UNIVERSES:
         return None
     try:
         from backend.shared.stock_pool.resolver import resolve_pool_sync
         from backend.shared.stock_utils import StockCodeUtil
 
-        snap = resolve_pool_sync(_normalize_pool_ref(universe))
+        snap = resolve_pool_sync(_normalize_pool_ref(universe), **owner_kwargs)
         if snap.unfiltered:
             return None
         if not snap.symbols:
@@ -103,6 +136,30 @@ def _resolve_custom_pool_instruments(universe: str) -> list[str] | None:
     except Exception as e:
         logger.warning("custom pool %s resolve failed: %s", universe, e)
         return None
+
+
+def _alphasage_instrument_selection(
+    universe: str,
+    *,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+) -> tuple[dict, dict]:
+    """Return the worker's supported instrument shape and frozen custom symbols."""
+    instruments = _resolve_custom_pool_instruments(
+        universe, tenant_id=tenant_id, user_id=user_id
+    )
+    if instruments is None:
+        if universe not in _ALPHASAGE_QILIB_INSTRUMENTS:
+            raise ValueError("AlphaSAGE 不支持所选 Qlib 指数或未冻结的自定义股票池")
+        return {"instrument": universe}, {}
+    normalized = sorted({symbol.lower() for symbol in instruments})
+    if (
+        not normalized
+        or len(normalized) > 500
+        or any(not _ALPHASAGE_SYMBOL_RE.fullmatch(symbol) for symbol in normalized)
+    ):
+        raise ValueError("AlphaSAGE 自定义股票池须为 1–500 个 Qlib 标的")
+    return {"instruments": normalized}, {"resolved_instruments": normalized}
 
 
 _running_backtests: set[str] = set()
@@ -208,9 +265,91 @@ async def _run_subprocess_tracked(
 
 async def _require_owned_task(task_id: str, request: Request) -> dict:
     """返回任务状态，若不属于当前认证用户则 404（不泄露任务是否存在）。"""
-    auth_user_id, _ = get_authenticated_identity(request)
+    auth_user_id, auth_tenant_id = get_authenticated_identity(request)
     launcher = get_launcher()
     status = await launcher.get_task_status(task_id)
+    in_memory_alphasage = bool(
+        status
+        and status.get("user_id") == auth_user_id
+        and status.get("algorithm") == "alphasage"
+    )
+    if status and status.get("user_id") == auth_user_id and not in_memory_alphasage:
+        return status
+
+    # AlphaSAGE may still be queued (or survive an engine restart) without an
+    # in-memory EvolutionTask. Resolve it through the authenticated DB scope.
+    try:
+        from backend.services.engine.qlib_app.services.rd_agent_persistence import (
+            AlphaMiningTaskPersistence,
+        )
+
+        durable = await AlphaMiningTaskPersistence().get_for_owner_with_spec(
+            task_id, tenant_id=auth_tenant_id, user_id=auth_user_id
+        )
+    except Exception as exc:
+        # Preserve the legacy in-memory path when the optional durable lookup is
+        # unavailable; AlphaSAGE itself cannot be read without its owner record.
+        if in_memory_alphasage:
+            raise HTTPException(
+                status_code=503,
+                detail="AlphaSAGE task state is temporarily unavailable",
+            ) from exc
+        durable = None
+    if durable and durable.get("algorithm") == "alphasage":
+        params = durable.get("params_snapshot") or {}
+        if isinstance(params, str):
+            try:
+                import json
+
+                params = json.loads(params)
+            except (TypeError, ValueError):
+                params = {}
+        if not isinstance(params, dict):
+            params = {}
+        executor = durable.get("executor_json") or {}
+        if isinstance(executor, str):
+            try:
+                import json
+
+                executor = json.loads(executor)
+            except (TypeError, ValueError):
+                executor = {}
+        if not isinstance(executor, dict):
+            executor = {}
+        progress_snapshot = executor.get("progress")
+        if not isinstance(progress_snapshot, dict):
+            progress_snapshot = {}
+        return {
+            "task_id": task_id,
+            "tenant_id": auth_tenant_id,
+            "user_id": auth_user_id,
+            "algorithm": "alphasage",
+            "algorithm_version": durable.get("algorithm_version"),
+            "status": durable.get("status"),
+            "phase": durable.get("phase"),
+            "progress": durable.get("progress"),
+            "progress_pct": durable.get("progress_pct") or 0,
+            "current_loop": 0,
+            "loop_n": durable.get("loop_n") or 3,
+            "market": durable.get("market") or "a_share",
+            "universe": durable.get("universe") or params.get("universe"),
+            "data_source": durable.get("data_source") or "qlib_bin",
+            "datasets": [],
+            "mining_start": params.get("mining_start"),
+            "mining_end": params.get("mining_end"),
+            "valid_start": params.get("valid_start"),
+            "valid_end": params.get("valid_end"),
+            "error_message": durable.get("error_message"),
+            "result": None,
+            "timeline": [],
+            "token_usage": {},
+            "mining_progress": progress_snapshot,
+            "created_at": durable.get("created_at"),
+            "updated_at": durable.get("updated_at"),
+            "completed_at": durable.get("completed_at"),
+        }
+    if in_memory_alphasage:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     if not status or status.get("user_id") != auth_user_id:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return status
@@ -405,6 +544,79 @@ async def get_task_status(task_id: str, request: Request):
 @router.post("/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str, request: Request):
     """取消演化任务"""
+    auth_user_id, auth_tenant_id = get_authenticated_identity(request)
+    from backend.services.engine.qlib_app.services.rd_agent_persistence import (
+        AlphaMiningTaskPersistence,
+    )
+
+    store = AlphaMiningTaskPersistence()
+    try:
+        durable = await store.get_for_owner_with_spec(
+            task_id, tenant_id=auth_tenant_id, user_id=auth_user_id
+        )
+    except Exception as exc:
+        in_memory = await get_launcher().get_task_status(task_id)
+        if in_memory and in_memory.get("algorithm") == "alphasage":
+            raise HTTPException(
+                status_code=503,
+                detail="AlphaSAGE 取消状态暂时无法核验",
+            ) from exc
+        # Keep existing in-memory cancellation available for RD-Agent and
+        # statistical tasks if their optional durable lookup is unavailable.
+        durable = None
+    if durable and durable.get("algorithm") == "alphasage":
+        current = await store.request_cancel(
+            task_id, tenant_id=auth_tenant_id, user_id=auth_user_id
+        )
+        if current is None:
+            raise HTTPException(
+                status_code=409,
+                detail="任务已进入终态或当前状态不可取消",
+            )
+        if current == "stopping":
+            from backend.services.engine.alpha_agent.alphasage.client import (
+                AlphaSageClient,
+                AlphaSageWorkerError,
+                AlphaSageWorkerNotFound,
+            )
+
+            try:
+                receipt = await AlphaSageClient().cancel(task_id)
+                if receipt.get("task_id") == task_id and str(
+                    receipt.get("status") or ""
+                ).lower() in {"completed", "failed", "cancelled"}:
+                    # The remote process is terminal. The owner's durable stop
+                    # request wins over a result that completed concurrently.
+                    await store.confirm_cancelled(
+                        task_id, tenant_id=auth_tenant_id, user_id=auth_user_id
+                    )
+            except AlphaSageWorkerNotFound:
+                # The isolated worker has no durable job/process for this ID.
+                await store.confirm_cancelled(
+                    task_id, tenant_id=auth_tenant_id, user_id=auth_user_id
+                )
+            except AlphaSageWorkerError as exc:
+                # Keep the row in stopping: the queued adapter retries DELETE
+                # and confirms exit before it releases the single GPU lease.
+                logger.info(
+                    "AlphaSAGE cancellation pending for %s (%s)",
+                    task_id,
+                    type(exc).__name__,
+                )
+        latest = await store.get_for_owner_with_spec(
+            task_id,
+            tenant_id=auth_tenant_id,
+            user_id=auth_user_id,
+            consistent=True,
+        )
+        status = str((latest or {}).get("status") or current)
+        return JSONResponse(
+            status_code=202 if status == "stopping" else 200,
+            content={"code": 202 if status == "stopping" else 200,
+                     "data": {"task_id": task_id, "status": status}},
+            headers={"Cache-Control": "private, no-store"},
+        )
+
     await _require_owned_task(task_id, request)
     launcher = get_launcher()
     ok = await launcher.cancel_task(task_id)
@@ -422,8 +634,14 @@ async def get_task_log(
 ):
     """获取任务的详细子进程日志（分页读取）"""
     await _require_owned_task(task_id, request)
+    auth_user_id, auth_tenant_id = get_authenticated_identity(request)
     launcher = get_launcher()
-    log_content = await launcher.get_task_log(task_id, tail=0)
+    log_content = await launcher.get_task_log(
+        task_id,
+        tail=0,
+        tenant_id=auth_tenant_id,
+        user_id=auth_user_id,
+    )
     if log_content is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id} log not found")
     all_lines = log_content.splitlines()
@@ -1088,8 +1306,43 @@ async def preview_mining(request: Request, payload: dict):
         except ValueError as exc:
             raise ValueError(f"Unknown market: {market}") from exc
         universe = values.get("universe", "all_a")
-        if market == "a_share" and not _universe_is_valid(universe):
+        universe_valid = (
+            _universe_is_valid(
+                universe, tenant_id=auth_tenant_id, user_id=auth_user_id
+            )
+            if algorithm.key == "alphasage"
+            else _universe_is_valid(universe)
+        )
+        if market == "a_share" and not universe_valid:
             raise ValueError("所选股票池不可用或不属于当前用户")
+        alphasage_config = None
+        if algorithm.key == "alphasage":
+            allowed_fields = {
+                "algorithm", "market", "universe", "freq", "datasets",
+                "data_source", "mining_start", "mining_end", "valid_start",
+                "valid_end", "auto_materialize", "horizon", "n_episodes",
+                "pool_capacity", "encoder_type", "seed",
+            }
+            unsupported = parsed.model_fields_set - allowed_fields
+            if unsupported:
+                raise ValueError(
+                    "AlphaSAGE 不支持这些请求字段: "
+                    + ", ".join(sorted(unsupported))
+                )
+            if values.get("data_source") not in {None, "", "qlib_bin"}:
+                raise ValueError("AlphaSAGE 仅支持公共 Qlib 日线数据")
+            if values.get("auto_materialize"):
+                raise ValueError("AlphaSAGE 暂不支持自动物化")
+            _alphasage_instrument_selection(
+                universe, tenant_id=auth_tenant_id, user_id=auth_user_id
+            )
+            alphasage_config = {
+                key: values[key]
+                for key in (
+                    "horizon", "n_episodes", "pool_capacity", "encoder_type", "seed"
+                )
+                if key in values
+            }
         statistical_config = None
         if algorithm.key == "statistical":
             from backend.services.engine.alpha_agent.statistical.configuration import (
@@ -1210,8 +1463,271 @@ async def preview_mining(request: Request, payload: dict):
             "window": window_preview,
             "requires_llm": algorithm.uses_llm,
             "statistical_config": statistical_config,
+            "alphasage_config": alphasage_config,
         },
     }
+
+
+@router.post("/mining/submit", status_code=202)
+async def submit_mining_task(
+    payload: dict,
+    request: Request,
+    idempotency_key: str = Header(
+        ..., alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+):
+    """Admit an AlphaSAGE run to the existing owner-scoped durable queue."""
+    user_id, tenant_id = get_authenticated_identity(request)
+    if not tenant_id or not user_id:
+        raise HTTPException(status_code=401, detail="Authenticated owner is required")
+
+    from backend.services.engine.alpha_agent.algorithm_registry import (
+        AlgorithmError,
+        resolve_algorithm,
+    )
+    from backend.services.engine.alpha_agent.api_models import MiningSubmitRequest
+    from backend.services.engine.alpha_agent.task_spec import (
+        ALPHASAGE_VERSION,
+        IdempotencyConflict,
+        MiningTaskSpec,
+    )
+
+    try:
+        parsed = MiningSubmitRequest.model_validate(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    values = parsed.model_dump(exclude_none=True)
+    if values.get("algorithm") != "alphasage":
+        raise HTTPException(status_code=400, detail="此入口仅接受 AlphaSAGE 任务")
+    supported_fields = {
+        "algorithm",
+        "market",
+        "universe",
+        "freq",
+        "data_source",
+        "datasets",
+        "mining_start",
+        "mining_end",
+        "valid_start",
+        "valid_end",
+        "auto_materialize",
+        "horizon",
+        "n_episodes",
+        "pool_capacity",
+        "encoder_type",
+        "seed",
+    }
+    unsupported_fields = parsed.model_fields_set - supported_fields
+    if unsupported_fields:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "AlphaSAGE 不支持这些请求字段: "
+                + ", ".join(sorted(unsupported_fields))
+            ),
+        )
+    if values.get("auto_materialize"):
+        raise HTTPException(
+            status_code=422,
+            detail="AlphaSAGE 暂不支持自动物化",
+        )
+
+    key = idempotency_key.strip()
+    if not key or len(key) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in key):
+        raise HTTPException(status_code=422, detail="Idempotency-Key 格式无效")
+
+    market = values.get("market") or "a_share"
+    freq = values.get("freq") or "day"
+    universe = values.get("universe") or "csi300"
+    if market != "a_share" or freq != "day":
+        raise HTTPException(status_code=400, detail="AlphaSAGE 仅支持 A 股日频")
+    if values.get("data_source") not in {None, "", "qlib_bin"}:
+        raise HTTPException(
+            status_code=400,
+            detail="AlphaSAGE 仅支持 QuantMind 公共 Qlib 日线数据",
+        )
+    if values.get("datasets"):
+        raise HTTPException(status_code=400, detail="AlphaSAGE 不消费数据集选择")
+
+    # Freeze normalized defaults in both snapshots. The worker only receives
+    # these persisted values and never sees a caller-selected local path.
+    request_parameters = {
+        "algorithm": "alphasage",
+        "market": market,
+        "universe": universe,
+        "freq": freq,
+        "data_source": "qlib_bin",
+        "datasets": [],
+        "mining_start": values["mining_start"],
+        "mining_end": values["mining_end"],
+        "valid_start": values["valid_start"],
+        "valid_end": values["valid_end"],
+        "horizon": values["horizon"],
+        "n_episodes": values["n_episodes"],
+        "pool_capacity": values["pool_capacity"],
+        "encoder_type": values["encoder_type"],
+        "seed": values["seed"],
+    }
+    parameters = {
+        **request_parameters,
+        "loop_n": 3,
+        "direction": "",
+    }
+    specification = MiningTaskSpec.build(
+        algorithm="alphasage",
+        algorithm_version=ALPHASAGE_VERSION,
+        request=request_parameters,
+        params=parameters,
+        data_snapshot={},
+        request_key=key,
+    )
+
+    from backend.services.engine.qlib_app.services.rd_agent_persistence import (
+        AlphaMiningTaskPersistence,
+    )
+
+    store = AlphaMiningTaskPersistence()
+    from backend.services.engine.alpha_agent.resource_budget import (
+        AlphaQueueFull,
+        submit_budget,
+    )
+    from backend.shared.resource_lease import LeaseUnavailable
+
+    async def existing_receipt(task_row: dict) -> JSONResponse:
+        existing_spec = await store.get_for_owner_with_spec(
+            str(task_row["task_id"]), tenant_id=tenant_id, user_id=user_id
+        )
+        if (
+            existing_spec is None
+            or existing_spec.get("algorithm") != "alphasage"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency-Key 已用于不同的 AlphaSAGE 请求",
+            )
+        frozen_request = existing_spec.get("request_snapshot")
+        if isinstance(frozen_request, str):
+            try:
+                frozen_request = json.loads(frozen_request)
+            except (TypeError, ValueError):
+                frozen_request = None
+        if frozen_request != request_parameters:
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency-Key 已用于不同的 AlphaSAGE 请求",
+            )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "code": 202,
+                "data": {
+                    "task_id": str(existing_spec["task_id"]),
+                    "algorithm": "alphasage",
+                    "status": existing_spec.get("status"),
+                    "queue_position": await _queue_position(
+                        str(existing_spec["task_id"]), tenant_id, user_id
+                    ),
+                },
+            },
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+    try:
+        existing = await store.get_by_request_key(
+            key, tenant_id=tenant_id, user_id=user_id
+        )
+        if existing is not None:
+            return await existing_receipt(existing)
+
+        if not _universe_is_valid(
+            universe, tenant_id=tenant_id, user_id=user_id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="所选股票池不可用或不属于当前用户",
+            )
+        try:
+            algorithm = resolve_algorithm(
+                "alphasage",
+                market=market,
+                freq=freq,
+                datasets=values.get("datasets"),
+            )
+        except (AlgorithmError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if algorithm.version != ALPHASAGE_VERSION:
+            raise HTTPException(status_code=503, detail="AlphaSAGE 算法版本配置不一致")
+        _, data_snapshot = _alphasage_instrument_selection(
+            universe, tenant_id=tenant_id, user_id=user_id
+        )
+        specification = MiningTaskSpec.build(
+            algorithm="alphasage",
+            algorithm_version=algorithm.version,
+            request=request_parameters,
+            params=parameters,
+            data_snapshot=data_snapshot,
+            request_key=key,
+        )
+
+        task_id = uuid.uuid4().hex[:16]
+        submit_budget(task_id, tenant_id, user_id)
+        admitted_task_id = await store.create(
+            task_id,
+            tenant_id,
+            user_id,
+            specification=specification,
+            market=market,
+            universe=universe,
+            loop_n=3,
+            direction="",
+            data_source="qlib_bin",
+            status="queued",
+            phase="queued",
+            progress="等待 AlphaSAGE GPU worker",
+            progress_pct=0,
+            executor_json="{}",
+        )
+        admitted_task_id = admitted_task_id or task_id
+        admitted = await store.get_for_owner_with_spec(
+            admitted_task_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            consistent=True,
+        )
+        if admitted is None:
+            raise RuntimeError("AlphaSAGE task admission could not be verified")
+        if admitted.get("algorithm") != "alphasage":
+            raise IdempotencyConflict("Idempotency key is bound to another algorithm")
+        return JSONResponse(
+            status_code=202,
+            content={
+                "code": 202,
+                "data": {
+                    "task_id": admitted_task_id,
+                    "algorithm": "alphasage",
+                    "status": admitted.get("status"),
+                    "queue_position": await _queue_position(
+                        admitted_task_id, tenant_id, user_id
+                    ),
+                },
+            },
+            headers={"Cache-Control": "private, no-store"},
+        )
+    except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except AlphaMiningTaskPersistence.CapacityExceeded as exc:
+        raise HTTPException(status_code=429, detail="挖掘任务队列已满") from exc
+    except (LeaseUnavailable, AlphaQueueFull) as exc:
+        raise HTTPException(status_code=503, detail="挖掘任务队列暂不可用") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- admission failure is not a partial receipt
+        logger.exception("AlphaSAGE task admission failed")
+        raise HTTPException(
+            status_code=503, detail="AlphaSAGE 任务暂时无法入队或核验"
+        ) from exc
 
 
 # ---- 企业版下放：方向分解与批量派发 ----

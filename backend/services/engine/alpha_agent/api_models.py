@@ -16,7 +16,7 @@ class MiningSubmitRequest(StatisticalOverrides):
     """
 
     model_config = ConfigDict(extra="forbid")
-    algorithm: Literal["rdagent", "statistical"] | None = None
+    algorithm: Literal["rdagent", "statistical", "alphasage"] | None = None
     market: Literal["a_share"] | None = None
     universe: str | None = Field(None, min_length=1, max_length=64)
     loop_n: int | None = Field(None, ge=1, le=20, strict=True)
@@ -34,6 +34,11 @@ class MiningSubmitRequest(StatisticalOverrides):
     valid_start: str | None = Field(None, min_length=10, max_length=10)
     valid_end: str | None = Field(None, min_length=10, max_length=10)
     auto_materialize: bool = False
+    horizon: int | None = Field(None, ge=1, le=20, strict=True)
+    n_episodes: int | None = Field(None, ge=16, le=2_000, strict=True)
+    pool_capacity: int | None = Field(None, ge=1, le=32, strict=True)
+    encoder_type: Literal["gnn"] | None = None
+    seed: int | None = Field(None, ge=0, le=2_147_483_647, strict=True)
 
     @model_validator(mode="after")
     def validate_statistical_window(self):
@@ -49,13 +54,52 @@ class MiningSubmitRequest(StatisticalOverrides):
                 self.valid_end,
             )
         if self.algorithm != "statistical":
+            if self.algorithm != "alphasage":
+                if any(
+                    value is not None
+                    for value in (
+                        self.horizon,
+                        self.n_episodes,
+                        self.pool_capacity,
+                        self.encoder_type,
+                        self.seed,
+                    )
+                ):
+                    raise ValueError("AlphaSAGE 专属参数只能用于 alphasage")
+                return self
+
+            required = {
+                "mining_start": self.mining_start,
+                "mining_end": self.mining_end,
+                "valid_start": self.valid_start,
+                "valid_end": self.valid_end,
+                "horizon": self.horizon,
+                "n_episodes": self.n_episodes,
+                "pool_capacity": self.pool_capacity,
+                "encoder_type": self.encoder_type,
+                "seed": self.seed,
+            }
+            missing = [key for key, value in required.items() if value is None]
+            if missing:
+                raise ValueError(
+                    "AlphaSAGE 必须提供完整训练/验证区间和参数: "
+                    + ", ".join(missing)
+                )
+            mining_start = date.fromisoformat(self.mining_start)
+            mining_end = date.fromisoformat(self.mining_end)
+            valid_start = date.fromisoformat(self.valid_start)
+            valid_end = date.fromisoformat(self.valid_end)
+            if mining_start > mining_end:
+                raise ValueError("mining_start 不能晚于 mining_end")
+            if valid_start > valid_end:
+                raise ValueError("valid_start 不能晚于 valid_end")
+            if valid_start <= mining_end:
+                raise ValueError("AlphaSAGE 验证区间必须严格晚于训练区间")
             return self
+
         if not self.mining_start or not self.mining_end:
             raise ValueError("统计派必须提供 mining_start 和 mining_end")
-        start, end = (
-            date.fromisoformat(self.mining_start),
-            date.fromisoformat(self.mining_end),
-        )
+        start, end = date.fromisoformat(self.mining_start), date.fromisoformat(self.mining_end)
         if start > end:
             raise ValueError("mining_start 不能晚于 mining_end")
         if (self.valid_start is None) != (self.valid_end is None):

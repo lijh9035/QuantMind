@@ -14,6 +14,7 @@ import {
   type MiningTaskHistoryPage,
   type MiningTaskTrajectory,
   type StatisticalMiningResult,
+  type AlphaSageMiningResult,
   type MiningTaskFactorResult,
 } from '../services-v2/taskHistoryApi';
 import { formatDateTime } from '../utils-v2';
@@ -39,6 +40,7 @@ interface MiningTaskDetails {
   lines: string[];
   totalLines: number;
   statisticalResult: StatisticalMiningResult | null;
+  alphaSageResult: AlphaSageMiningResult | null;
   factors: MiningTaskFactorResult[];
   trajectory: MiningTaskTrajectory | null;
   directionSelection?: unknown;
@@ -223,7 +225,7 @@ export const TaskCenterPage: React.FC = () => {
     detailController.current = controller;
     const generation = getSessionGeneration();
     setDetailsLoading(item.task_id);
-    setDetails({ taskId: item.task_id, algorithm: item.algorithm, progress: item.progress, error: item.error, lines: [], totalLines: 0, statisticalResult: null, factors: [], trajectory: null, directionSelection: item.params_snapshot?.direction_selection });
+    setDetails({ taskId: item.task_id, algorithm: item.algorithm, progress: item.progress, error: item.error, lines: [], totalLines: 0, statisticalResult: null, alphaSageResult: null, factors: [], trajectory: null, directionSelection: item.params_snapshot?.direction_selection });
     const [logResult, resultResponse, trajectoryResponse] = await Promise.all([
       getTaskLog(item.task_id, controller.signal).then(
         (value) => ({ ok: true as const, value }),
@@ -233,7 +235,7 @@ export const TaskCenterPage: React.FC = () => {
           (value) => ({ ok: true as const, value }),
           () => ({ ok: false as const }),
         ),
-      item.algorithm !== 'statistical'
+      item.algorithm === 'rdagent'
         ? getTaskTrajectory(item.task_id, controller.signal).then(
           (value) => ({ ok: true as const, value }),
           () => ({ ok: false as const }),
@@ -248,7 +250,12 @@ export const TaskCenterPage: React.FC = () => {
       error: item.error,
       lines: logResult.ok ? logResult.value.lines.slice(-200) : [],
       totalLines: logResult.ok ? logResult.value.total : 0,
-      statisticalResult: resultResponse.ok ? resultResponse.value.result : null,
+      statisticalResult: resultResponse.ok && resultResponse.value.algorithm === 'statistical'
+        ? resultResponse.value.result as StatisticalMiningResult | null
+        : null,
+      alphaSageResult: resultResponse.ok && resultResponse.value.algorithm === 'alphasage'
+        ? resultResponse.value.result as AlphaSageMiningResult | null
+        : null,
       factors: resultResponse.ok ? resultResponse.value.factors : [],
       trajectory: trajectoryResponse.ok ? trajectoryResponse.value : null,
       directionSelection: item.params_snapshot?.direction_selection,
@@ -386,7 +393,7 @@ export const TaskCenterPage: React.FC = () => {
                     {item.source_doc_id && <div className="mt-0.5 text-[11px] text-muted-foreground" title={item.source_doc_id}>来自本人研究文档</div>}
                     {item.seed_factor_ids?.length > 0 && <div className="mt-0.5 truncate text-[11px] text-muted-foreground" title={item.seed_factor_ids.join('、')}>父本：{item.seed_factor_ids.map((id) => id.slice(0, 8)).join('、')}</div>}
                   </td>
-                  <td className="px-3 py-2 whitespace-nowrap">{item.algorithm === 'statistical' ? '统计挖掘' : 'RD-Agent'}<div className="text-[11px] text-muted-foreground">{item.algorithm_version || '版本未知'}</div></td>
+                  <td className="px-3 py-2 whitespace-nowrap">{item.algorithm === 'statistical' ? '统计挖掘' : item.algorithm === 'alphasage' ? 'AlphaSAGE GNN' : 'RD-Agent'}<div className="text-[11px] text-muted-foreground">{item.algorithm_version || '版本未知'}</div></td>
                   <td className="px-3 py-2 whitespace-nowrap">{scopeLabel(item.market)}<span className="text-muted-foreground"> · {item.universe || '—'}</span></td>
                   <td className="px-2 py-2 text-center"><Badge variant={statusVariant(item.status)} className="whitespace-nowrap">{STATUS_LABELS[item.status] || item.status}</Badge></td>
                   <td className="px-3 py-2 min-w-[150px]">
@@ -585,6 +592,28 @@ export const TaskCenterPage: React.FC = () => {
                 )}
               </div>
             )}
+            {details.algorithm === 'alphasage' && (
+              <div className="rounded-lg border border-border/50 p-3 text-xs">
+                <div className="font-medium mb-1.5">AlphaSAGE GNN 训练结果</div>
+                {details.alphaSageResult ? (
+                  <p className="text-muted-foreground">
+                    候选表达式 {details.alphaSageResult.candidate_count ?? details.alphaSageResult.candidates?.length ?? '—'} 个
+                    {details.alphaSageResult.training_window?.requested_start && details.alphaSageResult.training_window.requested_end
+                      ? ` · 挖掘窗 ${details.alphaSageResult.training_window.requested_start} 至 ${details.alphaSageResult.training_window.requested_end}`
+                      : ''}
+                    {details.alphaSageResult.training_window?.mature_label_end
+                      ? ` · 成熟训练标签截止 ${details.alphaSageResult.training_window.mature_label_end}`
+                      : ''}
+                    {details.alphaSageResult.validation_window?.start && details.alphaSageResult.validation_window.end
+                      ? ` · 独立验证窗 ${details.alphaSageResult.validation_window.start} 至 ${details.alphaSageResult.validation_window.end}`
+                      : ''}
+                    {details.alphaSageResult.validation_window?.evaluated === true
+                      ? ' · 验证已评估'
+                      : ' · 验证结果尚未记录'}
+                  </p>
+                ) : <p className="text-muted-foreground">结果尚不可用；请确认任务已完成后刷新详情。</p>}
+              </div>
+            )}
             <div>
               <div className="text-xs font-medium mb-1.5">本人因子结果</div>
               {details.factors.length === 0 ? (
@@ -612,7 +641,7 @@ export const TaskCenterPage: React.FC = () => {
                 </div>
               )}
             </div>
-            {details.algorithm !== 'statistical' && details.trajectory && (
+            {details.algorithm === 'rdagent' && details.trajectory && (
               <div>
                 <div className="text-xs font-medium mb-1.5">RD-Agent 决策轨迹</div>
                 <p className="text-xs text-muted-foreground mb-3">

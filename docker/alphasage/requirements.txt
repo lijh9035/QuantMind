@@ -1,0 +1,10 @@
+fastapi==0.115.12
+uvicorn==0.34.3
+numpy==2.3.2
+pandas==2.2.3
+pyqlib==0.9.6
+torch-geometric==2.6.1
+torchgfn==1.2.1
+gymnasium==1.2.0
+tensorboard==2.20.0
+tqdm==4.67.1

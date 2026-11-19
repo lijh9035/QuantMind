@@ -2748,7 +2748,8 @@ CREATE TABLE IF NOT EXISTS alpha_mining_task_specs (
     user_id TEXT NOT NULL CHECK (btrim(user_id) <> ''),
     task_id TEXT NOT NULL,
     schema_version INT NOT NULL CHECK (schema_version = 1),
-    algorithm TEXT NOT NULL CHECK (algorithm IN ('rdagent', 'statistical')),
+    algorithm TEXT NOT NULL CONSTRAINT alpha_mining_task_specs_algorithm_check
+        CHECK (algorithm IN ('rdagent', 'statistical', 'alphasage')),
     algorithm_version TEXT NOT NULL CHECK (btrim(algorithm_version) <> ''),
     request_key TEXT CHECK (
         request_key IS NULL OR (length(request_key) BETWEEN 1 AND 128 AND btrim(request_key) <> '')

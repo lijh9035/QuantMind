@@ -36,6 +36,18 @@ describe("factor mining algorithm directory", () => {
               requires_gpu: false,
             },
             {
+              key: "alphasage",
+              name: "AlphaSAGE GNN",
+              version: "1.0",
+              enabled: true,
+              valid: true,
+              markets: ["a_share"],
+              freqs: ["day"],
+              uses_llm: false,
+              uses_datasets: false,
+              requires_gpu: true,
+            },
+            {
               key: "future",
               name: "Future",
               enabled: true,
@@ -79,6 +91,7 @@ describe("factor mining algorithm directory", () => {
     expect(result.data?.algorithms.map((item) => item.key)).toEqual([
       "rdagent",
       "statistical",
+      "alphasage",
     ]);
   });
 

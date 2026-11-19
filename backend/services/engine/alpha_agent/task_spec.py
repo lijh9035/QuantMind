@@ -10,6 +10,7 @@ from typing import Any
 
 RD_AGENT_VERSION = "quantmind-rd/1.0"
 STATISTICAL_VERSION = "quantmind-statistical/2.0"
+ALPHASAGE_VERSION = "quantmind-alphasage/1.0"
 PARAMETER_KEYS = frozenset(
     {
         "algorithm",
@@ -58,6 +59,11 @@ PARAMETER_KEYS = frozenset(
         "composite_z_window",
         "net_ic_cost_rate",
         "auto_materialize",
+        "horizon",
+        "n_episodes",
+        "pool_capacity",
+        "encoder_type",
+        "seed",
     }
 )
 
@@ -105,7 +111,7 @@ class MiningTaskSpec:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.algorithm not in {"rdagent", "statistical"}:
+        if self.algorithm not in {"rdagent", "statistical", "alphasage"}:
             raise ValueError("Unknown mining algorithm")
         if (
             not isinstance(self.algorithm_version, str)

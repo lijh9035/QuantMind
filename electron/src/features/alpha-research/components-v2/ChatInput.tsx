@@ -3,7 +3,7 @@ import { Send, Square, Compass, WandSparkles, BookOpen, CalendarDays, ChevronDow
 import { useAppSelector } from '../../../store';
 import { getSessionGeneration, registerSessionReset } from '../../../store/sessionBoundary';
 import { getSessionScopedStorageKey } from '../../../store/sessionScopedStorage';
-import { TaskConfig, UniverseId, UniverseInfo, type StatisticalMiningOptions } from '../types-v2';
+import { TaskConfig, UniverseId, UniverseInfo, type AlphaSageMiningOptions, type StatisticalMiningOptions } from '../types-v2';
 import { StatisticalOptionsPanel, StatisticalOptionsSummary, effectiveStatisticalOptions, statisticalOptionsError } from './StatisticalOptionsPanel';
 import { getUniverses } from '../services-v2/api';
 import type { MiningPreview } from '../services-v2/api';
@@ -59,19 +59,25 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   const [universes, setUniverses] = useState<UniverseInfo[]>([]);
   const [algorithms, setAlgorithms] = useState<MiningAlgorithmOption[]>([]);
   const [algorithmsReady, setAlgorithmsReady] = useState(false);
-  const [algorithm, setAlgorithm] = useState<'rdagent' | 'statistical'>('rdagent');
+  const [algorithm, setAlgorithm] = useState<'rdagent' | 'statistical' | 'alphasage'>('rdagent');
   const [windowExpanded, setWindowExpanded] = useState(false);
-  const algorithmRef = useRef<'rdagent' | 'statistical'>('rdagent');
-  const selectAlgorithm = (value: 'rdagent' | 'statistical') => {
+  const algorithmRef = useRef<'rdagent' | 'statistical' | 'alphasage'>('rdagent');
+  const selectAlgorithm = (value: 'rdagent' | 'statistical' | 'alphasage') => {
     algorithmRef.current = value;
     setAlgorithm(value);
-    setWindowExpanded(value === 'statistical');
+    setWindowExpanded(value === 'statistical' || value === 'alphasage');
   };
   const [miningStart, setMiningStart] = useState('');
   const [miningEnd, setMiningEnd] = useState('');
   const [validStart, setValidStart] = useState('');
   const [validEnd, setValidEnd] = useState('');
   const [statisticalConfig, setStatisticalConfig] = useState<StatisticalMiningOptions | undefined>();
+  const [alphaSageConfig, setAlphaSageConfig] = useState<AlphaSageMiningOptions>({
+    horizon: 5,
+    nEpisodes: 1000,
+    poolCapacity: 20,
+    seed: 0,
+  });
   const [preview, setPreview] = useState<MiningPreview | null>(null);
   const [pendingConfig, setPendingConfig] = useState<TaskConfig | null>(null);
   const [previewing, setPreviewing] = useState(false);
@@ -93,6 +99,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       setValidStart('');
       setValidEnd('');
       setStatisticalConfig(undefined);
+      setAlphaSageConfig({ horizon: 5, nEpisodes: 1000, poolCapacity: 20, seed: 0 });
       setPreview(null);
       setPendingConfig(null);
       setPreviewError('');
@@ -144,6 +151,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 
   const invalidDateWindow = (
     (algorithm === 'statistical' && (!miningStart || !miningEnd))
+    || (algorithm === 'alphasage' && (!miningStart || !miningEnd || !validStart || !validEnd))
     || Boolean(miningStart) !== Boolean(miningEnd)
     || (Boolean(miningStart && miningEnd) && miningStart > miningEnd)
     || Boolean(validStart) !== Boolean(validEnd)
@@ -157,11 +165,17 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   const invalidStatisticalOptions = algorithm === 'statistical' && effectiveStatisticalConfig
     ? statisticalOptionsError(effectiveStatisticalConfig)
     : null;
+  const invalidAlphaSageOptions = algorithm === 'alphasage' && (
+    !Number.isInteger(alphaSageConfig.nEpisodes) || alphaSageConfig.nEpisodes < 16 || alphaSageConfig.nEpisodes > 2000
+    || !Number.isInteger(alphaSageConfig.poolCapacity) || alphaSageConfig.poolCapacity < 1 || alphaSageConfig.poolCapacity > 32
+  );
+  const dateWindowLabel = algorithm === 'statistical' ? '统计' : algorithm === 'alphasage' ? 'AlphaSAGE' : 'RD-Agent';
 
   const buildTaskConfig = (): TaskConfig => ({
     userInput: input.trim(),
     algorithm,
     statisticalConfig: algorithm === 'statistical' ? effectiveStatisticalConfig : undefined,
+    alphaSageConfig: algorithm === 'alphasage' ? alphaSageConfig : undefined,
     autoMaterialize: false,
     miningStart: miningStart || undefined,
     miningEnd: miningEnd || undefined,
@@ -176,7 +190,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   });
 
   const handleSubmit = async () => {
-    if (isRunning || previewing || invalidDateWindow || invalidStatisticalOptions
+    if (isRunning || previewing || invalidDateWindow || invalidStatisticalOptions || invalidAlphaSageOptions
       || !isAuthenticated || isAuthenticating || !algorithmsReady) return;
     const generation = getSessionGeneration();
     const taskConfig = buildTaskConfig();
@@ -271,9 +285,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         <div className="px-5 pt-5 sm:px-6">
           {algorithm === 'statistical'
             ? <p className="text-xs font-semibold text-slate-800">统计因子搜索</p>
-            : <label htmlFor="mining-research-prompt" className="text-xs font-semibold text-slate-800">研究假设</label>}
+            : algorithm === 'alphasage'
+              ? <p className="text-xs font-semibold text-slate-800">AlphaSAGE GNN 数值挖掘</p>
+              : <label htmlFor="mining-research-prompt" className="text-xs font-semibold text-slate-800">研究假设</label>}
           <p className="mt-1 text-xs leading-5 text-slate-400">
-            {algorithm === 'statistical' ? '选择日期窗口后，按固定候选空间搜索日频量价因子。' : '描述你想验证的市场规律、信号或因子组合。'}
+            {algorithm === 'statistical'
+              ? '选择日期窗口后，按固定候选空间搜索日频量价因子。'
+              : algorithm === 'alphasage'
+                ? 'GPU 训练只使用成熟的挖掘标签；训练完成后由 QuantMind 在独立验证区间评估候选。'
+                : '描述你想验证的市场规律、信号或因子组合。'}
           </p>
           {algorithm === 'rdagent' && (
             <textarea
@@ -294,6 +314,39 @@ export const ChatInput: React.FC<ChatInputProps> = ({
               rows={4}
               style={{ minHeight: '112px', maxHeight: '240px' }}
             />
+          )}
+          {algorithm === 'alphasage' && (
+            <div className="mt-3 grid gap-3 rounded-xl border border-blue-100 bg-blue-50/40 p-3 sm:grid-cols-3">
+              <label className="text-xs font-medium text-slate-600">
+                预测周期（交易日）
+                <select aria-label="AlphaSAGE 预测周期" value={alphaSageConfig.horizon}
+                  onChange={(event) => setAlphaSageConfig((current) => ({ ...current, horizon: Number(event.target.value) }))}
+                  disabled={isRunning || previewing}
+                  className="mt-1 block w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700">
+                  {[1, 5, 10, 20].map((value) => <option key={value} value={value}>{value} 日</option>)}
+                </select>
+              </label>
+              <label className="text-xs font-medium text-slate-600">
+                GFN 训练轮数
+                <input aria-label="AlphaSAGE 训练轮数" type="number" min={16} max={2000} step={16}
+                  value={alphaSageConfig.nEpisodes}
+                  onChange={(event) => setAlphaSageConfig((current) => ({ ...current, nEpisodes: Number(event.target.value) }))}
+                  disabled={isRunning || previewing}
+                  className="mt-1 block w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700" />
+              </label>
+              <label className="text-xs font-medium text-slate-600">
+                候选池容量
+                <input aria-label="AlphaSAGE 候选池容量" type="number" min={1} max={32} step={1}
+                  value={alphaSageConfig.poolCapacity}
+                  onChange={(event) => setAlphaSageConfig((current) => ({ ...current, poolCapacity: Number(event.target.value) }))}
+                  disabled={isRunning || previewing}
+                  className="mt-1 block w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700" />
+              </label>
+              {(alphaSageConfig.nEpisodes < 16 || alphaSageConfig.nEpisodes > 2000 || !Number.isInteger(alphaSageConfig.nEpisodes)
+                || alphaSageConfig.poolCapacity < 1 || alphaSageConfig.poolCapacity > 32 || !Number.isInteger(alphaSageConfig.poolCapacity)) && (
+                <p role="alert" className="text-xs text-amber-700 sm:col-span-3">训练轮数需为 16–2000 的整数，候选池容量需为 1–32 的整数。</p>
+              )}
+            </div>
           )}
           <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-3">
             <div className="flex flex-wrap items-center gap-1">
@@ -356,7 +409,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
             className="flex w-full items-center gap-2 py-3 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-300"
           >
             <CalendarDays className="h-4 w-4 shrink-0 text-slate-400" />
-            <span className="shrink-0 font-medium text-slate-600">{algorithm === 'statistical' ? '统计窗口' : '实验窗口'}</span>
+            <span className="shrink-0 font-medium text-slate-600">{algorithm === 'statistical' ? '统计窗口' : algorithm === 'alphasage' ? '训练 / 验证窗口' : '实验窗口'}</span>
             <span className={`min-w-0 flex-1 truncate ${invalidDateWindow ? 'text-amber-700' : 'text-slate-400'}`}>
               {invalidDateWindow ? '请完善日期区间' : miningStart ? `${miningStart} 至 ${miningEnd}${validStart ? ` · OOS ${validStart} 至 ${validEnd}` : ''}` : '使用系统默认窗口 · 可选'}
             </span>
@@ -365,24 +418,26 @@ export const ChatInput: React.FC<ChatInputProps> = ({
           <div id="mining-date-window" hidden={!windowExpanded} className="pb-4">
             <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-4">
               <fieldset className="min-w-0">
-                <legend className="mb-2 text-xs font-medium text-slate-600">挖掘区间{algorithm === 'statistical' ? '（必填）' : '（可选）'}</legend>
+                <legend className="mb-2 text-xs font-medium text-slate-600">挖掘区间{algorithm === 'rdagent' ? '（可选）' : '（必填）'}</legend>
                 <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 text-xs text-slate-400">
-                  <input aria-label={`${algorithm === 'statistical' ? '统计' : 'RD-Agent'}挖掘开始日期`} type="date" value={miningStart} onChange={(event) => setMiningStart(event.target.value)} disabled={isRunning} className="w-full min-w-0 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:opacity-50" />
+                  <input aria-label={`${dateWindowLabel}挖掘开始日期`} type="date" value={miningStart} onChange={(event) => setMiningStart(event.target.value)} disabled={isRunning} className="w-full min-w-0 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:opacity-50" />
                   <span>至</span>
-                  <input aria-label={`${algorithm === 'statistical' ? '统计' : 'RD-Agent'}挖掘结束日期`} type="date" value={miningEnd} onChange={(event) => setMiningEnd(event.target.value)} disabled={isRunning} className="w-full min-w-0 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:opacity-50" />
+                  <input aria-label={`${dateWindowLabel}挖掘结束日期`} type="date" value={miningEnd} onChange={(event) => setMiningEnd(event.target.value)} disabled={isRunning} className="w-full min-w-0 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:opacity-50" />
                 </div>
               </fieldset>
               <fieldset className="min-w-0">
-                <legend className="mb-2 text-xs font-medium text-slate-600">样本外检验 OOS（可选）</legend>
+                <legend className="mb-2 text-xs font-medium text-slate-600">
+                  {algorithm === 'alphasage' ? '独立验证区间（必填）' : '样本外检验 OOS（可选）'}
+                </legend>
                 <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 text-xs text-slate-400">
-                  <input aria-label={`${algorithm === 'statistical' ? '统计' : 'RD-Agent'}验证开始日期`} type="date" value={validStart} onChange={(event) => setValidStart(event.target.value)} disabled={isRunning} className="w-full min-w-0 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:opacity-50" />
+                  <input aria-label={`${dateWindowLabel}验证开始日期`} type="date" value={validStart} onChange={(event) => setValidStart(event.target.value)} disabled={isRunning} className="w-full min-w-0 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:opacity-50" />
                   <span>至</span>
-                  <input aria-label={`${algorithm === 'statistical' ? '统计' : 'RD-Agent'}验证结束日期`} type="date" value={validEnd} onChange={(event) => setValidEnd(event.target.value)} disabled={isRunning} className="w-full min-w-0 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:opacity-50" />
+                  <input aria-label={`${dateWindowLabel}验证结束日期`} type="date" value={validEnd} onChange={(event) => setValidEnd(event.target.value)} disabled={isRunning} className="w-full min-w-0 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-100 disabled:opacity-50" />
                 </div>
               </fieldset>
             </div>
             <p className={`mt-3 text-xs leading-5 ${invalidDateWindow ? 'text-amber-700' : 'text-slate-400'}`}>
-              {algorithm === 'statistical' ? '请填写完整挖掘区间。' : '留空使用服务器默认训练窗口。'}日期须从早到晚，OOS 必须位于挖掘区间之后。
+              {algorithm === 'rdagent' ? '留空使用服务器默认训练窗口。' : '请填写完整的挖掘区间和独立验证区间。'}日期须从早到晚，验证区间必须位于挖掘区间之后。
             </p>
           </div>
         </div>
@@ -394,7 +449,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         )}
 
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 bg-slate-50/60 px-5 py-4 sm:px-6">
-          <span className="text-xs text-slate-400">{algorithm === 'statistical' ? '确认参数后开始搜索' : 'Enter 预览 · Shift + Enter 换行'}</span>
+          <span className="text-xs text-slate-400">{algorithm === 'rdagent' ? 'Enter 预览 · Shift + Enter 换行' : '确认参数后提交到持久化研究队列'}</span>
           {isRunning && onStop ? (
             <button
               type="button"
@@ -409,7 +464,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
             <button
               type="button"
               onClick={handleSubmit}
-              disabled={isRunning || previewing || !isAuthenticated || isAuthenticating || !algorithmsReady || invalidDateWindow || Boolean(invalidStatisticalOptions)}
+              disabled={isRunning || previewing || !isAuthenticated || isAuthenticating || !algorithmsReady || invalidDateWindow || Boolean(invalidStatisticalOptions) || invalidAlphaSageOptions}
               className="ml-auto inline-flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-xs font-semibold text-white shadow-sm shadow-blue-500/20 transition-colors hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:shadow-none"
               title={previewing ? '正在预览参数' : '发送 (Enter)'}
             >
@@ -470,8 +525,15 @@ const PreviewDialog: React.FC<{
         {preview.direction_quota && <><dt className="text-slate-500">配额预演</dt><dd>{preview.direction_quota.available ? `三档名额 ${preview.direction_quota.slots.explore}/${preview.direction_quota.slots.exploit}/${preview.direction_quota.slots.mutate}（探索/优选/变异），已打分 ${preview.direction_quota.directions.length} 条候选` : `暂不可用：${preview.direction_quota.error ?? '方向史或饱和数据读取出错'}，提交时将退回历史空白度加权`}</dd></>}
         <dt className="text-slate-500">日期窗口</dt><dd>{preview.window.mode === 'custom' ? preview.algorithm.key === 'statistical'
           ? `${preview.window.mining?.join(' 至 ')}${preview.window.oos ? `；OOS ${preview.window.oos.join(' 至 ')}` : '；未设置 OOS'}`
-          : `${preview.window.mining?.join(' 至 ')}；训练 ${preview.window.train?.join(' 至 ')}；验证 ${preview.window.valid?.join(' 至 ')}；测试 ${preview.window.test?.join(' 至 ')}${preview.window.oos ? `；OOS ${preview.window.oos.join(' 至 ')}` : ''}` : '使用服务器默认窗口'}</dd>
+          : preview.algorithm.key === 'alphasage'
+            ? `挖掘 ${preview.window.mining?.join(' 至 ')}；独立验证 ${preview.window.valid?.join(' 至 ')}`
+            : `${preview.window.mining?.join(' 至 ')}；训练 ${preview.window.train?.join(' 至 ')}；验证 ${preview.window.valid?.join(' 至 ')}；测试 ${preview.window.test?.join(' 至 ')}${preview.window.oos ? `；OOS ${preview.window.oos.join(' 至 ')}` : ''}` : '使用服务器默认窗口'}</dd>
         {preview.algorithm.key === 'rdagent' && <><dt className="text-slate-500">演化轮数</dt><dd>{preview.loop_n}</dd></>}
+        {preview.algorithm.key === 'alphasage' && preview.alphasage_config && <>
+          <dt className="text-slate-500">预测周期</dt><dd>{preview.alphasage_config.horizon} 个交易日</dd>
+          <dt className="text-slate-500">GNN 训练</dt><dd>{preview.alphasage_config.nEpisodes} episodes · 候选池 {preview.alphasage_config.poolCapacity}</dd>
+          <dt className="text-slate-500">验证边界</dt><dd>仅训练窗内成熟标签参与 GFN；独立验证窗由 QuantMind 训练后评估</dd>
+        </>}
         <dt className="text-slate-500">LLM</dt><dd>{preview.requires_llm ? '需要' : '不需要'}</dd>
       </dl>
       {preview.algorithm.key === 'statistical' && preview.statistical_config && <StatisticalOptionsSummary value={preview.statistical_config} />}

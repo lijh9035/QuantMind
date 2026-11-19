@@ -1,0 +1,21 @@
+key: alphasage
+name: AlphaSAGE GFlowNet 因子挖掘
+version: quantmind-alphasage/1.0
+desc: GPU 搜索量价表达式，经 QuantMind 安全转换与数值验算后入库
+vendor: BerkinChen/AlphaSAGE
+enabled: true
+tags: [gflownet, gpu, expression]
+markets: [a_share]
+freqs: [day]
+uses_datasets: false
+uses_llm: false
+requires_gpu: true
+progress_kind: jsonl
+stages:
+  - {key: data, label: 读取 Qlib 数据}
+  - {key: train, label: GPU 搜索}
+  - {key: extract, label: 提取候选因子}
+  - {key: convert, label: 转换与语义校验}
+  - {key: evaluate, label: 验算}
+  - {key: persist, label: 因子入库}
+runner: backend/services/engine/alpha_agent/alphasage/worker.py

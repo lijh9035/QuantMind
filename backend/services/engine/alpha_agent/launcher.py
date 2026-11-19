@@ -496,6 +496,16 @@ class AlphaAgentLauncher:
         return provider_uri
 
     async def run_queued(self, record: dict[str, Any]) -> None:
+        algorithm = str(record.get("algorithm") or "rdagent")
+        if algorithm == "alphasage":
+            from backend.services.engine.alpha_agent.alphasage.worker import (
+                run_alphasage_queued,
+            )
+
+            await run_alphasage_queued(record)
+            return
+        if algorithm not in {"rdagent", "statistical"}:
+            raise ValueError(f"Unsupported persisted mining algorithm: {algorithm}")
         from backend.shared.owner_scope import OwnerScope
 
         owner = OwnerScope(record.get("tenant_id"), record.get("user_id"))
@@ -615,7 +625,7 @@ class AlphaAgentLauncher:
         task = self._tasks.get(task_id)
         if not task:
             return None
-        return {
+        status = {
             "task_id": task.task_id,
             "user_id": task.user_id,
             "tenant_id": task.tenant_id,
@@ -638,6 +648,10 @@ class AlphaAgentLauncher:
             "timeline": task.timeline,
             "token_usage": task.token_usage,
         }
+        algorithm = getattr(task, "algorithm", None)
+        if algorithm:
+            status["algorithm"] = algorithm
+        return status
 
     async def cancel_task(self, task_id: str) -> bool:
         task = self._tasks.get(task_id)
@@ -658,16 +672,33 @@ class AlphaAgentLauncher:
         self._persist_task(task)
         return True
 
-    async def get_task_log(self, task_id: str, tail: int = 0) -> str | None:
+    async def get_task_log(
+        self,
+        task_id: str,
+        tail: int = 0,
+        *,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+    ) -> str | None:
         """Get subprocess stdout log for a task.
 
         Args:
             tail: If 0, return the full file. If > 0, return the last N lines.
         """
         task = self._tasks.get(task_id)
-        if not task:
+        if task is not None:
+            if (tenant_id is not None and task.tenant_id != tenant_id) or (
+                user_id is not None and task.user_id != user_id
+            ):
+                return None
+            log_directory = self._resolve_task_dir(task)
+        elif tenant_id and user_id:
+            # Durable tasks may be polled after a restart, before the dispatcher
+            # has reconstructed an in-memory EvolutionTask.
+            log_directory = self.task_dir(task_id, tenant_id, user_id)
+        else:
             return None
-        log_file = self._log_dir / task_id / "subprocess_stdout.log"
+        log_file = log_directory / "subprocess_stdout.log"
         if not log_file.exists():
             return None
         try:

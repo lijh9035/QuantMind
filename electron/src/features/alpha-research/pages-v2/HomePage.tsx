@@ -153,7 +153,13 @@ export const HomePage: React.FC<HomePageProps> = ({ onNavigate }) => {
                 </span>
               )}
               <span className="text-xs font-bold text-blue-700 whitespace-nowrap">
-                {miningStarting ? '任务提交中...' : '任务运行中'}
+                {miningStarting
+                  ? '任务提交中...'
+                  : task?.config.algorithm === 'alphasage'
+                    ? task.status === 'queued'
+                      ? 'AlphaSAGE 等待 GPU 队列'
+                      : task.status === 'stopping' ? 'AlphaSAGE 正在停止' : 'AlphaSAGE GPU 训练中'
+                    : '任务运行中'}
               </span>
               <span
                 className="text-xs text-blue-600/70 truncate flex-1 min-w-0"

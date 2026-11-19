@@ -27,6 +27,7 @@ import type {
   UniverseInfo,
   WsMessage,
   StatisticalMiningOptions,
+  AlphaSageMiningOptions,
 } from '../types-v2';
 
 // ========================== Defaults ==========================
@@ -96,6 +97,7 @@ const PHASE_MAP: Record<string, ExecutionPhase> = {
   pending: 'parsing',
   queued: 'parsing',
   starting: 'parsing',
+  training: 'evolving',
   scenario: 'parsing',
   hypothesis: 'planning',
   experiment: 'planning',
@@ -202,8 +204,9 @@ function normalizeAgentFactor(raw: any): Factor {
 
 export interface MiningStartParams {
   direction: string;
-  algorithm?: 'rdagent' | 'statistical';
+  algorithm?: 'rdagent' | 'statistical' | 'alphasage';
   statisticalConfig?: StatisticalMiningOptions;
+  alphaSageConfig?: AlphaSageMiningOptions;
   autoMaterialize?: boolean;
   miningStart?: string;
   miningEnd?: string;
@@ -262,10 +265,29 @@ export interface MiningPreview {
   };
   requires_llm: boolean;
   statistical_config?: StatisticalMiningOptions | null;
+  alphasage_config?: AlphaSageMiningOptions | null;
 }
 
 function miningRequestBody(params: MiningStartParams) {
   const loopN = params.maxRounds ?? 3;
+  if (params.algorithm === 'alphasage') {
+    const options = params.alphaSageConfig;
+    return {
+      algorithm: 'alphasage',
+      market: 'a_share',
+      freq: params.freq ?? 'day',
+      universe: params.universe ?? 'all_a',
+      mining_start: params.miningStart,
+      mining_end: params.miningEnd,
+      valid_start: params.validStart,
+      valid_end: params.validEnd,
+      horizon: options?.horizon ?? 5,
+      n_episodes: options?.nEpisodes ?? 1000,
+      pool_capacity: options?.poolCapacity ?? 20,
+      encoder_type: 'gnn',
+      seed: options?.seed ?? 0,
+    };
+  }
   if (params.algorithm === 'statistical') {
     return {
       ...params.statisticalConfig,
@@ -302,6 +324,49 @@ function miningRequestBody(params: MiningStartParams) {
 export async function previewMining(
   params: MiningStartParams,
 ): Promise<ApiResponse<MiningPreview>> {
+  if (params.algorithm === 'alphasage') {
+    const response = await apiClient.get('/alpha-agent/algorithms');
+    const algorithms = response.data?.data?.algorithms;
+    const capability = Array.isArray(algorithms)
+      ? algorithms.find((item: any) => item?.key === 'alphasage' && item?.enabled === true && item?.valid === true)
+      : null;
+    if (!capability) throw new Error('AlphaSAGE 当前不可用，请检查后端 GPU 服务状态');
+    const options = params.alphaSageConfig ?? { horizon: 5, nEpisodes: 1000, poolCapacity: 20, seed: 0 };
+    const mining = params.miningStart && params.miningEnd
+      ? [params.miningStart, params.miningEnd] as [string, string]
+      : undefined;
+    const valid = params.validStart && params.validEnd
+      ? [params.validStart, params.validEnd] as [string, string]
+      : undefined;
+    return makeOk({
+      algorithm: {
+        key: 'alphasage',
+        name: typeof capability.name === 'string' ? capability.name : 'AlphaSAGE',
+        version: typeof capability.version === 'string' ? capability.version : 'registered',
+        uses_llm: false,
+        uses_datasets: false,
+      },
+      market: 'a_share',
+      freq: params.freq ?? 'day',
+      universe: params.universe ?? 'all_a',
+      data_source: 'qlib_bin',
+      loop_n: options.nEpisodes,
+      direction: '',
+      directions: [],
+      direction_mode: 'selected',
+      datasets: {},
+      window: {
+        mode: 'custom',
+        mining,
+        train: mining,
+        valid,
+        test: undefined,
+        oos: valid,
+      },
+      requires_llm: false,
+      alphasage_config: options,
+    });
+  }
   const res = await apiClient.post('/alpha-agent/preview', miningRequestBody(params));
   return makeOk(res.data?.data as MiningPreview);
 }
@@ -311,7 +376,10 @@ export async function startMining(
   requestKey: string,
   signal?: AbortSignal,
 ): Promise<ApiResponse<{ taskId: string; task: Task }>> {
-  const res = await apiClient.post('/alpha-agent/evolve', miningRequestBody(params), {
+  const submitPath = params.algorithm === 'alphasage'
+    ? '/alpha-agent/mining/submit'
+    : '/alpha-agent/evolve';
+  const res = await apiClient.post(submitPath, miningRequestBody(params), {
     headers: { 'Idempotency-Key': requestKey },
     signal,
   });
@@ -327,6 +395,7 @@ function miningSubmissionResponse(data: any, params: MiningStartParams): ApiResp
       userInput: params.direction,
       algorithm: params.algorithm ?? 'rdagent',
       statisticalConfig: params.statisticalConfig,
+      alphaSageConfig: params.alphaSageConfig,
       miningStart: params.miningStart,
       miningEnd: params.miningEnd,
       validStart: params.validStart,

@@ -77,10 +77,27 @@ export interface MiningTaskFactorResult {
 
 export interface MiningTaskResult {
   task_id: string;
-  algorithm: 'rdagent' | 'statistical';
+  algorithm: 'rdagent' | 'statistical' | 'alphasage';
   status: string;
-  result: StatisticalMiningResult | null;
+  result: StatisticalMiningResult | AlphaSageMiningResult | Record<string, unknown> | null;
   factors: MiningTaskFactorResult[];
+}
+
+export interface AlphaSageMiningResult {
+  candidate_count?: number;
+  training_window?: {
+    requested_start?: string;
+    requested_end?: string;
+    mature_label_end?: string;
+    horizon?: number;
+  };
+  validation_window?: {
+    start?: string;
+    end?: string;
+    evaluated?: boolean;
+  };
+  candidates?: Array<{ raw_expression?: string; factor_id?: string; status?: string }>;
+  [key: string]: unknown;
 }
 
 export interface MiningTaskTrajectory {
@@ -140,8 +157,8 @@ export async function getMiningResult(
 ): Promise<StatisticalMiningResult> {
   const taskResult = await getTaskMiningResult(taskId, signal);
   const result = taskResult.result;
-  if (!result) throw new Error('统计挖掘结果暂不可用');
-  return result;
+  if (taskResult.algorithm !== 'statistical' || !result) throw new Error('统计挖掘结果暂不可用');
+  return result as StatisticalMiningResult;
 }
 
 export async function getTaskMiningResult(
@@ -153,15 +170,14 @@ export async function getTaskMiningResult(
     { signal },
   );
   const data = response.data?.data;
-  if (
-    !data
-    || data.task_id !== taskId
-    || !['rdagent', 'statistical'].includes(data.algorithm)
-    || !Array.isArray(data.factors)
-    || (data.result !== null && data.result !== undefined && (
-      !Array.isArray(data.result.selected) || !Array.isArray(data.result.candidates)
-    ))
-  ) {
+  const validAlgorithm = ['rdagent', 'statistical', 'alphasage'].includes(data?.algorithm);
+  const validResult = data?.algorithm === 'statistical'
+    ? data.result !== null && data.result !== undefined
+      && Array.isArray(data.result.selected) && Array.isArray(data.result.candidates)
+    : data?.result === null || data?.result === undefined || (
+      typeof data.result === 'object' && !Array.isArray(data.result)
+    );
+  if (!data || data.task_id !== taskId || !validAlgorithm || !Array.isArray(data.factors) || !validResult) {
     throw new Error('挖掘任务结果格式无效');
   }
   return {

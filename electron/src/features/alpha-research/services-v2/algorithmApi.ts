@@ -2,8 +2,9 @@ import { apiClient } from "../../../services/aiStrategyClients";
 import type { ApiResponse, StatisticalMiningOptions } from "../types-v2";
 
 export interface MiningAlgorithmOption {
-  key: "rdagent" | "statistical";
+  key: "rdagent" | "statistical" | "alphasage";
   name: string;
+  version?: string;
   enabled: boolean;
   valid: boolean;
   markets: string[];
@@ -42,7 +43,7 @@ function isMiningAlgorithmOption(
   if (!value || typeof value !== "object") return false;
   const item = value as Record<string, unknown>;
   return (
-    (item.key === "rdagent" || item.key === "statistical") &&
+    (item.key === "rdagent" || item.key === "statistical" || item.key === "alphasage") &&
     typeof item.name === "string" &&
     item.valid === true &&
     item.enabled === true &&

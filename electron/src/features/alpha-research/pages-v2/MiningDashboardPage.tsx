@@ -56,7 +56,7 @@ export const MiningDashboardPage: React.FC<MiningDashboardPageProps> = ({ onNavi
           {task.status === 'queued'
             ? `排队中${task.queuePosition ? `（第 ${task.queuePosition} 位）` : ''}`
             : task.status === 'running'
-            ? '任务运行中'
+            ? task.config.algorithm === 'alphasage' ? 'AlphaSAGE GPU 训练中' : '任务运行中'
             : task.status === 'stopping'
               ? '正在停止，等待进程退出确认'
               : task.status === 'completed'

@@ -1,0 +1,69 @@
+# Opt-in isolated AlphaSAGE GPU worker. The API process is the only peer on
+# this private network; the worker has no path to QuantMind's DB/Redis network.
+name: quantmind
+
+services:
+  quantmind:
+    environment:
+      - ALPHASAGE_INTERNAL_TOKEN=${ALPHASAGE_INTERNAL_TOKEN:?Set ALPHASAGE_INTERNAL_TOKEN in the local .env}
+      - QM_ALPHASAGE_URL=http://alphasage-gpu:8090
+    networks:
+      - quantmind-net
+      - alphasage-private
+
+  alphasage-gpu:
+    profiles:
+      - alphasage
+    image: quantmind-alphasage:local
+    build:
+      context: .
+      dockerfile: docker/alphasage/Dockerfile
+      # WSL's HTTPS proxy listens on localhost; this is build-time only.
+      network: host
+      entitlements:
+        - network.host
+      args:
+        HTTPS_PROXY:
+        HTTP_PROXY:
+        https_proxy:
+        http_proxy:
+      additional_contexts:
+        alphasage_source: ${ALPHASAGE_SOURCE:-../AlphaSAGE}
+    container_name: quantmind-alphasage-gpu
+    environment:
+      QM_ALPHASAGE_TOKEN: ${ALPHASAGE_INTERNAL_TOKEN:?Set ALPHASAGE_INTERNAL_TOKEN in the local .env}
+      QM_ALPHASAGE_QLIB_DB: /qlib
+      QM_ALPHASAGE_JOBS: /jobs
+    volumes:
+      - type: bind
+        source: ${QLIB_PROVIDER_PATH:-./data/qlib/cn_data}
+        target: /qlib
+        read_only: true
+      - alphasage-jobs:/jobs
+    networks:
+      - alphasage-private
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: unless-stopped
+
+networks:
+  alphasage-private:
+    driver: bridge
+    internal: true
+
+volumes:
+  alphasage-jobs:
+    name: quantmind-alphasage-jobs

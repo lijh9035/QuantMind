@@ -95,12 +95,21 @@ export interface StatisticalMiningOptions {
   };
 }
 
+/** Whitelisted parameters for the isolated AlphaSAGE GFN worker. */
+export interface AlphaSageMiningOptions {
+  horizon: number;
+  nEpisodes: number;
+  poolCapacity: number;
+  seed: number;
+}
+
 // Task configuration
 export interface TaskConfig {
   // Basic configuration
   userInput: string;
-  algorithm?: 'rdagent' | 'statistical';
+  algorithm?: 'rdagent' | 'statistical' | 'alphasage';
   statisticalConfig?: StatisticalMiningOptions;
+  alphaSageConfig?: AlphaSageMiningOptions;
   autoMaterialize?: boolean;
   miningStart?: string;
   miningEnd?: string;

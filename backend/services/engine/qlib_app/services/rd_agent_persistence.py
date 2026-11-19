@@ -529,18 +529,46 @@ class RDAgentFactorPersistence:
                 results.append(item)
             return results
 
-    async def get_factor(self, factor_id: str) -> dict[str, Any] | None:
-        """获取单个因子详情"""
+    async def get_factor(
+        self,
+        factor_id: str,
+        *,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Get a factor and its current source revision.
+
+        Owner-aware API callers must provide both scope dimensions. Legacy
+        internal callers may continue to look up a globally unique factor ID.
+        """
+        if (tenant_id is None) != (user_id is None):
+            raise ValueError("Both owner dimensions are required")
+        params: dict[str, Any] = {"factor_id": factor_id}
+        owner_filter = ""
+        if tenant_id is not None and user_id is not None:
+            owner = OwnerScope(tenant_id, user_id)
+            params.update(owner.sql_params())
+            owner_filter = (
+                " AND factor.tenant_id=:tenant_id AND factor.user_id=:user_id"
+            )
         async with get_session(read_only=True) as session:
             row = await session.execute(
                 text("""
-                    SELECT factor_id, factor_name, factor_code, status, ic_value, sharpe_ratio,
-                           annual_return, max_drawdown, rank_ic, user_id, market, universe,
-                           factor_formulation, data_source, date_range, metadata_json, created_at, updated_at
-                    FROM rd_agent_factors
-                    WHERE factor_id = :factor_id
-                    """),
-                {"factor_id": factor_id},
+                    SELECT factor.factor_id, factor.factor_name, factor.factor_code,
+                           factor.status, factor.ic_value, factor.sharpe_ratio,
+                           factor.annual_return, factor.max_drawdown, factor.rank_ic,
+                           factor.user_id, factor.market, factor.universe,
+                           factor.factor_formulation, factor.data_source, factor.date_range,
+                           factor.metadata_json, factor.created_at, factor.updated_at,
+                           (SELECT MAX(revision.revision_no)
+                            FROM rd_agent_factor_revisions AS revision
+                            WHERE revision.tenant_id=factor.tenant_id
+                              AND revision.user_id=factor.user_id
+                              AND revision.factor_id=factor.factor_id) AS factor_revision_no
+                    FROM rd_agent_factors AS factor
+                    WHERE factor.factor_id = :factor_id
+                """ + owner_filter),
+                params,
             )
             r = row.mappings().first()
             if not r:
@@ -1488,6 +1516,312 @@ class AlphaMiningTaskPersistence:
             )
             if updated.rowcount != 1:
                 raise RuntimeError("Task left running state during result completion")
+            return True
+
+    async def complete_alphasage_with_result(
+        self,
+        task_id: str,
+        *,
+        tenant_id: str,
+        user_id: str,
+        algorithm_version: str,
+        execution_fingerprint: str,
+        result: dict[str, Any],
+        factors: list[dict[str, Any]],
+        max_bytes: int = 4 * 1024 * 1024,
+    ) -> bool:
+        """Atomically persist trusted AlphaSAGE factors and complete their task.
+
+        This intentionally has its own factor schema. Statistical task rows are
+        sealed by ``complete_with_result`` and must keep their algorithm-specific
+        proof checks unchanged.
+        """
+        owner = OwnerScope(tenant_id, user_id)
+        from backend.services.engine.alpha_agent.task_spec import ALPHASAGE_VERSION
+
+        if algorithm_version != ALPHASAGE_VERSION:
+            raise ValueError("Unsupported AlphaSAGE algorithm version")
+        if (
+            not isinstance(execution_fingerprint, str)
+            or len(execution_fingerprint) != 64
+            or any(char not in "0123456789abcdef" for char in execution_fingerprint)
+        ):
+            raise ValueError("A valid AlphaSAGE execution fingerprint is required")
+        if not isinstance(result, dict) or (
+            result.get("task_id") != task_id
+            or result.get("algorithm") != "alphasage"
+            or result.get("algorithm_version") != algorithm_version
+            or result.get("execution_fingerprint") != execution_fingerprint
+            or result.get("status")
+            not in {"completed", "completed_with_zero_factors"}
+        ):
+            raise ValueError("AlphaSAGE result identity is invalid")
+        if not isinstance(factors, list) or len(factors) > 128:
+            raise ValueError("AlphaSAGE factor count exceeds its supported bound")
+        encoded_result = json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        if len(encoded_result.encode("utf-8")) > max_bytes:
+            raise ValueError("AlphaSAGE result exceeds the storage limit")
+
+        validated: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        seen_expressions: set[str] = set()
+        for factor in factors:
+            required = {
+                "factor_id",
+                "factor_name",
+                "factor_code",
+                "rank_ic",
+                "factor_formulation",
+                "market",
+                "universe",
+                "date_range",
+                "data_source",
+                "metadata",
+            }
+            if not isinstance(factor, dict) or factor.keys() != required:
+                raise ValueError("AlphaSAGE factor row has an invalid schema")
+            metadata = factor["metadata"]
+            factor_code = factor["factor_code"]
+            source_index = metadata.get("source_index") if isinstance(metadata, dict) else None
+            if (
+                not isinstance(factor["factor_id"], str)
+                or factor["factor_id"] != f"as-{task_id}-{source_index}"
+                or factor["factor_id"] in seen_ids
+                or type(source_index) is not int
+                or not 0 <= source_index < 128
+                or not isinstance(factor["factor_name"], str)
+                or not factor["factor_name"]
+                or len(factor["factor_name"]) > 256
+                or not isinstance(factor_code, str)
+                or not factor_code.startswith("fm:")
+                or len(factor_code) > 8192
+                or factor_code in seen_expressions
+                or not isinstance(factor["factor_formulation"], str)
+                or len(factor["factor_formulation"]) > 2000
+                or factor["market"] != "a_share"
+                or not isinstance(factor["universe"], str)
+                or len(factor["universe"]) > 128
+                or not isinstance(factor["date_range"], str)
+                or len(factor["date_range"]) > 64
+                or factor["data_source"] != "qlib_bin"
+                or not isinstance(metadata, dict)
+                or metadata.get("task_id") != task_id
+                or metadata.get("algorithm") != "alphasage"
+                or metadata.get("algorithm_version") != algorithm_version
+                or metadata.get("execution_fingerprint") != execution_fingerprint
+                or metadata.get("canonical_expression") != factor_code
+                or not isinstance(metadata.get("source_expression"), str)
+                or not isinstance(metadata.get("semantic_check"), dict)
+                or metadata["semantic_check"].get("passed") is not True
+                or (
+                    factor["rank_ic"] is not None
+                    and (
+                        type(factor["rank_ic"]) not in (int, float)
+                        or not math.isfinite(factor["rank_ic"])
+                    )
+                )
+            ):
+                raise ValueError("AlphaSAGE factor row contains invalid values")
+            from backend.services.engine.alpha_agent.alphasage.expression_converter import (
+                convert_expression,
+            )
+
+            converted = convert_expression(metadata["source_expression"])
+            if isinstance(converted, dict):
+                converted_expression = converted.get("canonical_expression")
+                accepted = converted.get(
+                    "structurally_supported", converted.get("accepted")
+                )
+            else:
+                converted_expression = getattr(
+                    converted, "canonical_expression", None
+                )
+                accepted = getattr(
+                    converted,
+                    "structurally_supported",
+                    getattr(converted, "accepted", False),
+                )
+            if accepted is not True or converted_expression != factor_code:
+                raise ValueError("AlphaSAGE factor is not the registered conversion")
+            encoded_metadata = json.dumps(
+                metadata,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if len(encoded_metadata.encode("utf-8")) > 256 * 1024:
+                raise ValueError("AlphaSAGE factor metadata exceeds 256 KiB")
+            seen_ids.add(factor["factor_id"])
+            seen_expressions.add(factor_code)
+            validated.append({**factor, "metadata_json": encoded_metadata})
+
+        if result.get("persisted_count") != len(validated):
+            raise ValueError("AlphaSAGE persisted factor count does not match result")
+
+        async with get_session() as session:
+            task = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT task.status,task.execution_fingerprint,"
+                            "spec.algorithm,spec.algorithm_version "
+                            "FROM alpha_mining_tasks AS task "
+                            "JOIN alpha_mining_task_specs AS spec "
+                            "ON spec.task_id=task.task_id AND spec.tenant_id=task.tenant_id "
+                            "AND spec.user_id=task.user_id "
+                            "WHERE task.task_id=:task AND task.tenant_id=:tenant_id "
+                            "AND task.user_id=:user_id FOR UPDATE OF task,spec"
+                        ),
+                        {"task": task_id, **owner.sql_params()},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if task is None:
+                raise LookupError("AlphaSAGE task owner scope no longer matches")
+            if (
+                task["algorithm"] != "alphasage"
+                or task["algorithm_version"] != algorithm_version
+                or task["execution_fingerprint"] != execution_fingerprint
+            ):
+                raise ValueError("AlphaSAGE task identity or execution fingerprint changed")
+
+            if task["status"] == "completed":
+                existing = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT execution_fingerprint,result_json "
+                                "FROM alpha_mining_task_results WHERE task_id=:task "
+                                "AND tenant_id=:tenant_id AND user_id=:user_id"
+                            ),
+                            {"task": task_id, **owner.sql_params()},
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
+                if (
+                    existing is not None
+                    and existing["execution_fingerprint"] == execution_fingerprint
+                    and existing["result_json"] == result
+                ):
+                    return False
+                raise RuntimeError("A different AlphaSAGE result already exists")
+            if task["status"] != "running":
+                raise ValueError("AlphaSAGE task is not in a result-persistable state")
+
+            for factor in validated:
+                inserted_factor = await session.execute(
+                    text(
+                        "INSERT INTO rd_agent_factors "
+                        "(factor_id,factor_name,factor_code,status,user_id,tenant_id,"
+                        "metadata_json,market,universe,rank_ic,ic_value,factor_formulation,"
+                        "data_source,date_range) VALUES (:factor_id,:factor_name,:factor_code,"
+                        "'pending',:user_id,:tenant_id,CAST(:metadata AS jsonb),:market,"
+                        ":universe,:rank_ic,:rank_ic,:factor_formulation,:data_source,:date_range) "
+                        "ON CONFLICT (factor_id) DO NOTHING"
+                    ),
+                    {
+                        **owner.sql_params(),
+                        "factor_id": factor["factor_id"],
+                        "factor_name": factor["factor_name"],
+                        "factor_code": factor["factor_code"],
+                        "metadata": factor["metadata_json"],
+                        "market": factor["market"],
+                        "universe": factor["universe"],
+                        "rank_ic": factor["rank_ic"],
+                        "factor_formulation": factor["factor_formulation"],
+                        "data_source": factor["data_source"],
+                        "date_range": factor["date_range"],
+                    },
+                )
+                if inserted_factor.rowcount != 1:
+                    existing_factor = (
+                        (
+                            await session.execute(
+                                text(
+                                    "SELECT tenant_id,user_id,factor_name,factor_code,metadata_json "
+                                    "FROM rd_agent_factors WHERE factor_id=:factor_id "
+                                    "AND tenant_id=:tenant_id AND user_id=:user_id"
+                                ),
+                                {"factor_id": factor["factor_id"], **owner.sql_params()},
+                            )
+                        )
+                        .mappings()
+                        .first()
+                    )
+                    if (
+                        existing_factor is None
+                        or existing_factor["tenant_id"] != owner.tenant_id
+                        or existing_factor["user_id"] != owner.user_id
+                        or existing_factor["factor_name"] != factor["factor_name"]
+                        or existing_factor["factor_code"] != factor["factor_code"]
+                        or existing_factor["metadata_json"] != factor["metadata"]
+                    ):
+                        raise ValueError("AlphaSAGE factor ID belongs to another record")
+
+            inserted_result = await session.execute(
+                text(
+                    "INSERT INTO alpha_mining_task_results "
+                    "(tenant_id,user_id,task_id,execution_fingerprint,result_json) "
+                    "VALUES (:tenant_id,:user_id,:task,:fingerprint,CAST(:result AS jsonb)) "
+                    "ON CONFLICT (tenant_id,user_id,task_id) DO NOTHING"
+                ),
+                {
+                    **owner.sql_params(),
+                    "task": task_id,
+                    "fingerprint": execution_fingerprint,
+                    "result": encoded_result,
+                },
+            )
+            if inserted_result.rowcount != 1:
+                existing_result = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT execution_fingerprint,result_json "
+                                "FROM alpha_mining_task_results WHERE task_id=:task "
+                                "AND tenant_id=:tenant_id AND user_id=:user_id"
+                            ),
+                            {"task": task_id, **owner.sql_params()},
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
+                if (
+                    existing_result is None
+                    or existing_result["execution_fingerprint"] != execution_fingerprint
+                    or existing_result["result_json"] != result
+                ):
+                    raise RuntimeError("A different AlphaSAGE result already exists")
+
+            updated = await session.execute(
+                text(
+                    "UPDATE alpha_mining_tasks SET status='completed', "
+                    "phase='completed', progress='AlphaSAGE 因子转换、评价与入库完成', "
+                    "progress_pct=100, completed_at=COALESCE(completed_at,now()), "
+                    "updated_at=now() WHERE task_id=:task AND tenant_id=:tenant_id "
+                    "AND user_id=:user_id AND status='running' "
+                    "AND execution_fingerprint=:fingerprint"
+                ),
+                {
+                    **owner.sql_params(),
+                    "task": task_id,
+                    "fingerprint": execution_fingerprint,
+                },
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("AlphaSAGE task left running state during completion")
             return True
 
     async def get_result(
