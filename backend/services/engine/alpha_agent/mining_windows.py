@@ -34,15 +34,26 @@ def build_mining_window_env(
 
     mining_s, mining_e = mining
     span_days = (mining_e - mining_s).days
+    if span_days < 3:
+        raise ValueError("挖掘区间至少需要四个自然日以构造训练、验证和测试段")
+
     train_cut = mining_s + timedelta(days=round(span_days * 0.70))
     if validation is not None:
         valid_cut = mining_e
         test = validation
     else:
-        valid_cut = mining_s + timedelta(days=round(span_days * 0.85))
-        test = (valid_cut, mining_e)
+        valid_cut = min(
+            mining_s + timedelta(days=round(span_days * 0.85)),
+            mining_e - timedelta(days=1),
+        )
+        test = (valid_cut + timedelta(days=1), mining_e)
 
-    train = (mining_s, train_cut)
+    if train_cut >= valid_cut:
+        raise ValueError("挖掘区间不足以划分非重叠训练段和验证段")
+
+    # Qlib treats both segment endpoints as inclusive. Keep adjacent
+    # train/validation/test windows disjoint to avoid leakage at cut dates.
+    train = (mining_s, train_cut - timedelta(days=1))
     valid = (train_cut, valid_cut)
     env = {
         "QM_MINING_WINDOW_START": mining_s.isoformat(),

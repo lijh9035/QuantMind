@@ -261,6 +261,10 @@ class AlphaAgentLauncher:
         direction: str | None = None,
         data_source: str | None = None,
         llm_overrides: dict[str, str] | None = None,
+        mining_start: str | None = None,
+        mining_end: str | None = None,
+        valid_start: str | None = None,
+        valid_end: str | None = None,
     ) -> str:
         """Start a factor evolution task. Returns task_id.
 
@@ -272,9 +276,18 @@ class AlphaAgentLauncher:
         assert_factor_mining_hardware()
 
         task_id = uuid.uuid4().hex[:16]
+        from backend.services.engine.alpha_agent.mining_windows import (
+            build_mining_window_env,
+        )
+
+        build_mining_window_env(mining_start, mining_end, valid_start, valid_end)
         task = EvolutionTask(
             task_id=task_id, user_id=user_id, market=market,
             universe=universe, loop_n=loop_n, data_source=data_source or "",
+            mining_start=mining_start or None,
+            mining_end=mining_end or None,
+            valid_start=valid_start or None,
+            valid_end=valid_end or None,
         )
         self._tasks[task_id] = task
 
@@ -821,8 +834,11 @@ class AlphaAgentLauncher:
             "QLIB_FACTOR_UNIVERSE": task.universe,
             "REASONING_MODEL": chat_model,
             "CHAT_STREAM": "false",
+            # RD-Agent's local Qlib experiments use a filesystem-backed MLflow store.
+            "MLFLOW_ALLOW_FILE_STORE": os.getenv("MLFLOW_ALLOW_FILE_STORE", "true"),
             # 回测数据从 2016 年开始 (默认 2008 太慢)
             "QLIB_FACTOR_TRAIN_START": os.getenv("QLIB_FACTOR_TRAIN_START", "2016-01-01"),
+            "QLIB_FACTOR_TRAIN_END": os.getenv("QLIB_FACTOR_TRAIN_END", "2020-12-31"),
             "QLIB_FACTOR_VALID_START": os.getenv("QLIB_FACTOR_VALID_START", "2021-01-01"),
             "QLIB_FACTOR_VALID_END": os.getenv("QLIB_FACTOR_VALID_END", "2022-12-31"),
             "QLIB_FACTOR_TEST_START": os.getenv("QLIB_FACTOR_TEST_START", "2023-01-01"),
@@ -859,6 +875,18 @@ class AlphaAgentLauncher:
         from backend.services.engine.rd_agent.llm_env import build_llm_env
         # 最后执行：确保 LITELLM_* 与 OPENAI_* 的最终取值一致，不再被后续步骤改写
         build_llm_env(env)
+        from backend.services.engine.alpha_agent.mining_windows import (
+            build_mining_window_env,
+        )
+
+        env.update(
+            build_mining_window_env(
+                task.mining_start,
+                task.mining_end,
+                task.valid_start,
+                task.valid_end,
+            )
+        )
         return env
 
     async def _run_evolution(

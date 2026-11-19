@@ -413,8 +413,19 @@ def main():
 
         # 回测窗口默认近一年（仅 A 股；其他市场数据日历不同，保持全样本）
         if args.market == "a_share":
-            ic_start, ic_end = _near_one_year_window()
-            logger.info("IC window (recent 1y): %s ~ %s", ic_start, ic_end)
+            from backend.services.engine.alpha_agent.mining_windows import (
+                ic_window_from_env,
+            )
+
+            configured_window = ic_window_from_env(dict(os.environ))
+            if configured_window:
+                ic_start, ic_end, window_scope = configured_window
+                logger.info(
+                    "IC window (%s): %s ~ %s", window_scope, ic_start, ic_end
+                )
+            else:
+                ic_start, ic_end = _near_one_year_window()
+                logger.info("IC window (recent 1y): %s ~ %s", ic_start, ic_end)
         else:
             ic_start, ic_end = None, None
 
