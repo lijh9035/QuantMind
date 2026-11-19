@@ -26,7 +26,14 @@ logging.basicConfig(
 logger = logging.getLogger("rd_agent_run")
 
 
-async def persist_factors(factors: list[dict], task_id: str, user_id: str, market: str, universe: str = "csi300") -> int:
+async def persist_factors(
+    factors: list[dict],
+    task_id: str,
+    user_id: str,
+    market: str,
+    universe: str = "csi300",
+    tenant_id: str | None = None,
+) -> int:
     """持久化因子到数据库"""
     if not factors:
         return 0
@@ -38,6 +45,7 @@ async def persist_factors(factors: list[dict], task_id: str, user_id: str, marke
 
     persistence = RDAgentFactorPersistence()
     await persistence.ensure_tables()
+    tenant_id = (tenant_id or os.getenv("QM_FACTOR_TENANT_ID", "default")).strip() or "default"
 
     count = 0
     for f in factors:
@@ -63,6 +71,7 @@ async def persist_factors(factors: list[dict], task_id: str, user_id: str, marke
                 factor_name=f["name"],
                 factor_code=f.get("code", ""),
                 user_id=user_id,
+                tenant_id=tenant_id,
                 metadata=metadata,
                 market=market,
                 universe=universe,
@@ -294,13 +303,30 @@ except Exception as e:
             f.write(script)
             script_path = f.name
 
-        # Copy data file to /tmp for the script (factor code expects 'daily_pv.h5')
+        # Copy data file to /tmp for the script (factor code expects 'daily_pv.h5').
+        # An interrupted run can leave a zero-byte cache with a newer mtime.
         import shutil
-        tmp_data = '/tmp/daily_pv.h5'
-        if not os.path.exists(tmp_data):
-            shutil.copy2(data_path, tmp_data)
-        elif os.path.getmtime(data_path) > os.path.getmtime(tmp_data):
-            shutil.copy2(data_path, tmp_data)
+
+        source_data = Path(data_path)
+        tmp_data = Path("/tmp/daily_pv.h5")
+        if not source_data.is_file() or source_data.stat().st_size == 0:
+            logger.warning("IC input HDF5 is missing or empty: %s", source_data)
+            return {}
+
+        copy_required = (
+            not tmp_data.is_file()
+            or tmp_data.stat().st_size == 0
+            or source_data.stat().st_mtime > tmp_data.stat().st_mtime
+        )
+        if copy_required:
+            fd, staged_data = tempfile.mkstemp(prefix="daily_pv.", suffix=".h5", dir="/tmp")
+            os.close(fd)
+            try:
+                shutil.copy2(source_data, staged_data)
+                os.replace(staged_data, tmp_data)
+            finally:
+                if os.path.exists(staged_data):
+                    os.unlink(staged_data)
 
         result = subprocess.run(
             [sys.executable, script_path],
@@ -310,6 +336,14 @@ except Exception as e:
         os.unlink(script_path)
 
         output = result.stdout + result.stderr
+        if result.returncode != 0:
+            logger.warning(
+                "IC subprocess exited with code %d: %s",
+                result.returncode,
+                output[-2000:],
+            )
+            return {}
+
         metrics = {}
         for line in output.strip().split('\n'):
             if line.startswith('IC='):
@@ -321,6 +355,8 @@ except Exception as e:
             elif line.startswith('RANK_ICIR='):
                 metrics['rank_icir'] = float(line.split('=')[1])
 
+        if not metrics:
+            logger.warning("IC subprocess returned no metrics: %s", output[-2000:])
         return metrics
 
     except Exception as e:
@@ -438,6 +474,7 @@ def main():
         async def _persist_and_metrics() -> int:
             p = RDAgentFactorPersistence()
             await p.ensure_tables()
+            tenant_id = os.getenv("QM_FACTOR_TENANT_ID", "default").strip() or "default"
             saved = 0
             for f in factors:
                 try:
@@ -484,6 +521,7 @@ def main():
                         factor_name=f["name"],
                         factor_code=f.get("code", ""),
                         user_id=args.user_id,
+                        tenant_id=tenant_id,
                         metadata=metadata,
                         market=args.market,
                         universe=args.universe,

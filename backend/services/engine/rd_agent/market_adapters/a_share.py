@@ -96,75 +96,18 @@ class AShareAdapter(MarketAdapter):
     def generate_base_factors_json(self, output_dir: str) -> str | None:
         """生成 RD-Agent 可读取的 base_factors.json 文件。
 
-        从 feature catalog 读取 L1/L2 因子名列表，写入符合 RD-Agent 格式的
-        JSON 文件（feature_name -> expression/description）。供 LLM 在因子挖掘时
-        参考已有因子作为构建基础。
-
-        L2 高频因子（资金流/微观结构/已实现波动率）在 QuantDB 已预计算为日频值，
-        RD-Agent coder 可读取 daily_pv.h5 中已接入的 QuantDB 预计算列，因此这里
-        同时给出「可直接引用」的列清单（$<列名>）与需要自行用 Qlib 表达式实现的
-        近似模板，供 LLM 在微观结构/资金流概念空间里挖掘并改造因子。
+        该文件会被 RD-Agent 当作 Qlib 表达式传给 Qlib provider 校验和运行，
+        因此只写 Qlib 二进制缓存实际支持的表达式。QuantDB 富化列只存在于
+        daily_pv.h5，不能把它们或自然语言说明混入这个表达式映射。
 
         Returns:
             生成的文件路径，失败返回 None。
         """
         json_path = os.path.join(output_dir, "base_factors.json")
         try:
-            from backend.services.engine.data_platform.quantdb_hub import QuantDBDataHub
-            hub = QuantDBDataHub.get_instance()
-            if not hub.available:
-                return None
-
-            categories = hub.fetch_l1_factor_categories()
-            if not categories.get("categories"):
-                return None
-
-            # 从 catalog 文件读取完整 feature 列表
-            catalog_path = (
-                Path(__file__).resolve().parents[5]
-                / "config" / "features" / "model_training_feature_catalog_v1.json"
-            )
-            all_features: list[dict] = []
-            if catalog_path.exists():
-                import json as _json
-                with open(catalog_path, encoding="utf-8") as f:
-                    catalog = _json.load(f)
-                for cat in catalog.get("categories", []):
-                    cat_name = cat.get("name", "因子")
-                    for feat in cat.get("features", []):
-                        all_features.append({**feat, "_category": cat_name})
-
-            factors: dict[str, str] = {}
-
-            # Alpha158 表达式模板：给 LLM 提供可直接仿写的 Qlib 语法范例
-            known_expr = self._fallback_factors()
-            factors.update(known_expr)
-
-            # L2 高频因子的 Qlib 表达式近似（核心增量：让 AI 能挖 L2 概念因子）
+            factors = self._fallback_factors()
             l2_expr = self._l2_factor_expressions()
             factors.update(l2_expr)
-
-            # QuantDB 已接入 daily_pv.h5 的预计算列：可在因子表达式中直接引用
-            for out_col, desc in self._usable_quantdb_columns().items():
-                factors[out_col] = (
-                    f"${out_col}（QuantDB 预计算列，可直接在表达式中引用；{desc}）"
-                )
-
-            for feat in all_features:
-                feat_key = feat.get("key", "")
-                if not feat_key or feat_key in factors:
-                    continue
-                # catalog 中剩余因子（L1 预计算值）：给 LLM 提供分类/含义/公式作为参考
-                parts = [feat.get("_category", "因子")]
-                desc = (feat.get("description") or "").strip()
-                if desc:
-                    parts.append(desc)
-                formula = (feat.get("formula") or "").strip()
-                if formula:
-                    parts.append(f"公式: {formula}")
-                factors[feat_key] = (
-                    " | ".join(parts) + "（QuantDB 其余预计算列未接入 h5，仅供参考实现思路）"
-                )
 
             if not factors:
                 return None
@@ -175,7 +118,7 @@ class AShareAdapter(MarketAdapter):
                 _json.dump(factors, f, ensure_ascii=False, indent=2)
             import logging
             logging.getLogger(__name__).info(
-                "[%s] Generated base_factors.json: %d factors (L2 expr: %d) -> %s",
+                "[%s] Generated Qlib-compatible base_factors.json: %d expressions (L2: %d) -> %s",
                 self.market_id, len(factors), len(l2_expr), json_path,
             )
             return json_path
@@ -198,8 +141,8 @@ class AShareAdapter(MarketAdapter):
         """
         return {
             # ---- 已实现波动率族（L2 高频波动率的日频近似）----
-            "L2_RV5": "Std($close/Ref($close,1)-1, 5) * Sqrt(252)",
-            "L2_RV20": "Std($close/Ref($close,1)-1, 20) * Sqrt(252)",
+            "L2_RV5": "Std($close/Ref($close,1)-1, 5) * 15.874507866387544",
+            "L2_RV20": "Std($close/Ref($close,1)-1, 20) * 15.874507866387544",
             "L2_Jump": "Abs($close/Ref($close,1)-1) - Std($close/Ref($close,1)-1, 20)",
             "L2_RetSkew": "Mean(Power($close/Ref($close,1)-1, 3), 20) / Power(Std($close/Ref($close,1)-1, 20), 3)",
             "L2_RetKurt": "Mean(Power($close/Ref($close,1)-1, 4), 20) / Power(Std($close/Ref($close,1)-1, 20), 4)",
@@ -283,10 +226,24 @@ class AShareAdapter(MarketAdapter):
             "KMID": "($close - $open) / $open",
             "KLEN": "($high - $low) / $open",
             "KMID2": "($close - $open) / ($high - $low + 1e-12)",
-            "KUP": "($high - Max($open, $close)) / $open",
-            "KUP2": "($high - Max($open, $close)) / ($high - $low + 1e-12)",
-            "KLOW": "(Min($open, $close) - $low) / $open",
-            "KLOW2": "(Min($open, $close) - $low) / ($high - $low + 1e-12)",
+            # Qlib's Max/Min are rolling operators; express pointwise max/min
+            # algebraically so the expressions remain executable in Qlib.
+            "KUP": (
+                "($high - ($open + $close + Abs($open - $close)) / 2) "
+                "/ $open"
+            ),
+            "KUP2": (
+                "($high - ($open + $close + Abs($open - $close)) / 2) "
+                "/ ($high - $low + 1e-12)"
+            ),
+            "KLOW": (
+                "(($open + $close - Abs($open - $close)) / 2 - $low) "
+                "/ $open"
+            ),
+            "KLOW2": (
+                "(($open + $close - Abs($open - $close)) / 2 - $low) "
+                "/ ($high - $low + 1e-12)"
+            ),
             "KSFT": "(2 * $close - $high - $low) / $open",
             "KSFT2": "(2 * $close - $high - $low) / ($high - $low + 1e-12)",
             "ROC5": "Ref($close, 5) / $close - 1",
