@@ -200,6 +200,12 @@ if os.getenv("MODEL_ARCHIVE_PURGE_ENABLED", "true").lower() == "true":
         },
     }
 
+# Drain the durable AlphaSAGE factor-job outbox so admitted jobs reach workers.
+beat_schedule["dispatch-factor-job-outbox"] = {
+    "task": "engine.tasks.dispatch_factor_job_outbox",
+    "schedule": 5.0,
+}
+
 celery_app.conf.update(
     # 序列化
     task_serializer="json",
@@ -234,6 +240,7 @@ celery_app.conf.update(
         "qlib_app.tasks.*": {"queue": CELERY_QUEUE},
     },
     imports=(
+        "backend.services.engine.alpha_agent.factor_job_tasks",
         "backend.services.engine.qlib_app.tasks",
         "backend.services.engine.tasks.celery_tasks",
     ),
