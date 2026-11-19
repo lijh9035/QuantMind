@@ -6,6 +6,8 @@ import pytest
 
 from backend.services.engine.rd_agent.llm_env import (
     _allow_local_ollama_reasoning_param,
+    _allow_local_ollama_response_schema,
+    allow_rdagent_local_ollama_response_schema,
     build_llm_env,
 )
 
@@ -122,6 +124,50 @@ def test_local_qwen_preserves_other_allowed_openai_params(
         "seed",
         "reasoning_effort",
     ]
+
+
+def test_local_qwen_response_schema_is_scoped_to_configured_model(
+    clean_llm_environment: None,
+) -> None:
+    env = {
+        "CHAT_MODEL": "qwen3.5:9b-q4_K_M",
+        "OPENAI_BASE_URL": "http://host.docker.internal:11435/v1",
+        "OPENAI_API_KEY": "ollama",
+    }
+    build_llm_env(env)
+
+    assert _allow_local_ollama_response_schema(
+        env, "openai/qwen3.5:9b-q4_K_M"
+    )
+    assert not _allow_local_ollama_response_schema(env, "openai/another-model")
+
+
+def test_local_qwen_response_schema_capability_reaches_litellm(
+    clean_llm_environment: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rdagent.oai.backend import litellm as rdagent_litellm
+
+    env = {
+        "CHAT_MODEL": "qwen3.5:9b-q4_K_M",
+        "OPENAI_BASE_URL": "http://host.docker.internal:11435/v1",
+        "OPENAI_API_KEY": "ollama",
+    }
+    build_llm_env(env)
+    monkeypatch.setattr(
+        rdagent_litellm, "supports_response_schema", lambda model: False
+    )
+    monkeypatch.setattr(
+        rdagent_litellm,
+        "_qm_local_qwen_response_schema_passthrough",
+        False,
+        raising=False,
+    )
+
+    assert allow_rdagent_local_ollama_response_schema(env)
+    assert rdagent_litellm.supports_response_schema(
+        "openai/qwen3.5:9b-q4_K_M"
+    )
+    assert not rdagent_litellm.supports_response_schema("openai/another-model")
 
 
 def test_reasoning_param_is_not_allowed_for_other_models(

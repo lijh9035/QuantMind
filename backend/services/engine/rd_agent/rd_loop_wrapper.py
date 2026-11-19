@@ -228,11 +228,19 @@ class RDLoopWrapper:
             for k, v in env.items():
                 os.environ[k] = v
 
-            from .llm_env import allow_rdagent_none_reasoning_effort
+            from .llm_env import (
+                allow_rdagent_local_ollama_response_schema,
+                allow_rdagent_none_reasoning_effort,
+            )
 
             if allow_rdagent_none_reasoning_effort(env):
                 logger.info(
                     "[%s] Enabled Ollama reasoning_effort=none for Qwen 3.5 9B",
+                    self.market,
+                )
+            if allow_rdagent_local_ollama_response_schema(env):
+                logger.info(
+                    "[%s] Enabled Ollama JSON response_format for Qwen 3.5 9B",
                     self.market,
                 )
 

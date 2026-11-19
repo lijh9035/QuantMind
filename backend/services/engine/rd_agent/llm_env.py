@@ -86,6 +86,52 @@ def _allow_local_ollama_reasoning_param(
     return True
 
 
+def _allow_local_ollama_response_schema(env: dict[str, Any], model: Any) -> bool:
+    """Allow JSON mode only for the configured local Qwen/Ollama model."""
+    if not _uses_local_ollama_qwen(env):
+        return False
+
+    configured_model = (
+        env.get("LITELLM_CHAT_MODEL", "").strip()
+        or env.get("CHAT_MODEL", "").strip()
+    ).lower()
+    request_model = str(model or "").strip().lower()
+    if configured_model.startswith("openai/"):
+        configured_model = configured_model[len("openai/") :]
+    if request_model.startswith("openai/"):
+        request_model = request_model[len("openai/") :]
+    return request_model == configured_model
+
+
+def allow_rdagent_local_ollama_response_schema(env: dict[str, Any]) -> bool:
+    """Keep LiteLLM from stripping Ollama's supported OpenAI JSON mode."""
+    if not _uses_local_ollama_qwen(env):
+        return False
+
+    from rdagent.oai.backend import litellm as rdagent_litellm
+
+    if not getattr(
+        rdagent_litellm, "_qm_local_qwen_response_schema_passthrough", False
+    ):
+        original_supports_response_schema = (
+            rdagent_litellm.supports_response_schema
+        )
+        configured_env = dict(env)
+
+        def supports_response_schema_with_local_qwen(
+            model: Any, *args: Any, **kwargs: Any
+        ) -> bool:
+            if _allow_local_ollama_response_schema(configured_env, model):
+                return True
+            return original_supports_response_schema(model, *args, **kwargs)
+
+        rdagent_litellm.supports_response_schema = (
+            supports_response_schema_with_local_qwen
+        )
+        rdagent_litellm._qm_local_qwen_response_schema_passthrough = True
+    return True
+
+
 def allow_rdagent_none_reasoning_effort(env: dict[str, Any]) -> bool:
     """Enable the local Qwen thinking switch in this RD-Agent process."""
     if (
