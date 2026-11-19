@@ -337,6 +337,11 @@ def get_strategy_config():
             "stream": True,
             "temperature": 0.1,
         }
+        if self.model.strip().lower().startswith("qwen3.5"):
+            # Ollama's OpenAI-compatible Qwen 3.5 route returns the user-facing
+            # text reliably with reasoning_effort=none; think:false can produce
+            # an empty content stream on this model family.
+            payload["reasoning_effort"] = "none"
 
         from backend.services.engine.alpha_agent.llm_client import openai_chat_url
 

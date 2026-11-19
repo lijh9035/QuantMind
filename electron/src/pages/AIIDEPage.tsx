@@ -101,6 +101,7 @@ const AI_IDE_UNAVAILABLE_HINTS = [
     'networkerror',
     'fetch failed',
 ] as const;
+const AI_CHAT_TIMEOUT_MS = 180_000;
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const AI_ASSISTANT_DEVELOPMENT_RULES = [
@@ -447,6 +448,15 @@ const AIIDEPage: React.FC = () => {
     const normalizeChatError = (raw: string) => {
         const msg = String(raw || '').trim();
         const lower = msg.toLowerCase();
+        if (lower.includes('timed out') || lower.includes('timeout') || lower.includes('aborterror')) {
+            return 'AI 回复超时，请确认本地 Ollama 服务可用后重试。';
+        }
+        if (lower.includes('empty ai response') || lower.includes('no assistant text')) {
+            return '模型没有返回正文，请检查模型配置后重试。';
+        }
+        if (AI_IDE_UNAVAILABLE_HINTS.some((hint) => lower.includes(hint))) {
+            return 'AI-IDE 服务暂时不可达，请确认后端和本地 Ollama 已启动后重试。';
+        }
         if (lower.includes('api key not configured')) {
             return '尚未配置 AI Key，请在”个人中心 → 其他设置”中填写后重试。';
         }
@@ -1287,6 +1297,8 @@ const AIIDEPage: React.FC = () => {
         const initialAiMsg: Message = { id: aiMsgId, role: 'ai', content: '' };
         (setMessages as React.Dispatch<React.SetStateAction<Message[]>>)((curr) => [...curr, initialAiMsg]);
         setStreamingMessageId(aiMsgId);
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), AI_CHAT_TIMEOUT_MS);
 
         try {
             // Prepare history for backend
@@ -1297,6 +1309,7 @@ const AIIDEPage: React.FC = () => {
 
             const res = await apiFetch('/ai/chat', {
                 method: 'POST',
+                signal: controller.signal,
                 body: JSON.stringify({
                     message: content,
                     user_id: userId,
@@ -1359,31 +1372,40 @@ const AIIDEPage: React.FC = () => {
                             break;
                         }
 
+                        let parsed: any;
                         try {
-                            const parsed = JSON.parse(data);
-                            if (parsed && typeof parsed.delta === 'string') {
-                                accumulatedContent += parsed.delta;
-                                applyContent(accumulatedContent);
-                            }
-                        } catch (e) {
-                            // 忽略解析错误，或记录日志
+                            parsed = JSON.parse(data);
+                        } catch {
                             console.warn('Failed to parse SSE JSON:', data);
+                            continue;
+                        }
+                        if (parsed?.error) {
+                            throw new Error(String(parsed.error));
+                        }
+                        if (typeof parsed?.delta === 'string') {
+                            accumulatedContent += parsed.delta;
+                            applyContent(accumulatedContent);
                         }
                     }
                 }
                 if (finished) break;
             }
+            if (!accumulatedContent.trim()) {
+                throw new Error('empty AI response: Ollama returned no assistant text');
+            }
             applyContent(accumulatedContent);
-            setStreamingMessageId(null);
-            setIsAITyping(false);
         } catch (err) {
             console.error('Chat failed', err);
-            const rawErr = err instanceof Error ? err.message : 'LLM 请求失败';
+            const rawErr = controller.signal.aborted
+                ? 'AI chat timeout after 180 seconds'
+                : err instanceof Error ? err.message : 'LLM 请求失败';
             const errMsg = normalizeChatError(rawErr);
             message.error(errMsg);
             (setMessages as React.Dispatch<React.SetStateAction<Message[]>>)((curr) => curr.map((m) =>
                 m.id === aiMsgId ? { ...m, content: `❌ ${errMsg}` } : m
             ));
+        } finally {
+            window.clearTimeout(timeoutId);
             setStreamingMessageId(null);
             setIsAITyping(false);
         }
