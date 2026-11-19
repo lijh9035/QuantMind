@@ -83,6 +83,10 @@ class DataCfg(BaseModel):
     factor_catalog_published_at: str | None = None
     factor_coverage: dict = Field(default_factory=dict)
     quantdb_dir: str | None = None
+    # Private AlphaSAGE generation is mounted read-only by the API orchestrator.
+    user_factor_source_dir: str | None = None
+    user_factor_features: list[str] = Field(default_factory=list)
+    user_factor_generation_by_column: dict[str, str] = Field(default_factory=dict)
 
     # 全局股票池（P3）：编排器（有 DB 访问）解析后注入，训练容器据此过滤样本。
     # 容器内没有 DB，所以只传已解析的代码列表 + 内容校验和（用于结果可复现）。
@@ -196,4 +200,13 @@ def dump_contract_dict(cfg: TrainingConfig) -> dict:
     for _key in CONDITIONAL_KEYS:
         if out.get(_key) is None:
             out.pop(_key, None)
+    data = out.get("data")
+    if isinstance(data, dict):
+        for _key in (
+            "user_factor_source_dir",
+            "user_factor_features",
+            "user_factor_generation_by_column",
+        ):
+            if not data.get(_key):
+                data.pop(_key, None)
     return out

@@ -267,3 +267,27 @@ def test_builder_full_payload_split_and_xgb_strip():
     assert out["wfa"]["strategy"] == "rolling"
     assert out["factor_selection"]["n_top"] == 80
     assert dump_contract_dict(TrainingConfig.from_dict(out)) == out
+
+
+def test_builder_keeps_pinned_owner_factor_source_and_feature(monkeypatch):
+    o = _make_orchestrator()
+    monkeypatch.setattr(
+        o,
+        "_filter_features_by_parquet",
+        lambda _run_id, features: ([], list(features)),
+    )
+
+    out = o._build_config_yaml(
+        "b1_private",
+        {
+            "features": ["factor_test"],
+            "user_factor_generation_by_column": {"factor_test": "gen_123"},
+        },
+    )
+
+    assert out["data"]["features"] == ["factor_test"]
+    assert out["data"]["user_factor_source_dir"] == "/private_factors/rd_mined"
+    assert out["data"]["user_factor_features"] == ["factor_test"]
+    assert out["data"]["user_factor_generation_by_column"] == {
+        "factor_test": "gen_123"
+    }

@@ -335,7 +335,7 @@ def reconcile_orphaned_factor_jobs(client: Any) -> int:
                         )
                     session.execute(
                         text(
-                            "UPDATE alpha_user_factor_generations SET status='failed' "
+                            "UPDATE alpha_user_factor_generations SET status='failed',updated_at=now() "
                             "WHERE tenant_id=:tenant AND user_id=:user AND job_id=:job "
                             "AND dataset_key='rd_mined' AND status='building'"
                         ),

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ from docker import DockerClient
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from backend.services.api.routers.admin.db import TrainingJobRecord
 from backend.services.api.training_explain import normalize_explain
@@ -484,11 +486,18 @@ def _normalize_payload(payload: dict[str, Any], allowed_features: list[str]) -> 
     return normalized
 
 
-async def _resolve_quantdb_factor_payload(payload: dict[str, Any], market: str) -> tuple[dict[str, Any], list[str]]:
+async def _resolve_quantdb_factor_payload(
+    payload: dict[str, Any],
+    market: str,
+    *,
+    private_features: set[str] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
     """Validate an immutable published mapping and pin logical fields to raw columns."""
     source = str(payload.get("factor_source") or "").strip()
+    private = set(private_features or ())
     if not source:
-        return payload, await _load_allowed_features(market=market)
+        allowed = await _load_allowed_features(market=market)
+        return payload, list(dict.fromkeys([*allowed, *sorted(private)]))
     version_id = str(payload.get("factor_catalog_version") or "").strip()
     if not version_id:
         raise HTTPException(status_code=422, detail="factor_catalog_version is required for QuantDB direct training")
@@ -515,17 +524,19 @@ async def _resolve_quantdb_factor_payload(payload: dict[str, Any], market: str) 
         """), {"version_id": version_id, "source": source})).mappings().all()
     mapping = {str(row["feature_key"]): str(row["source_column"]) for row in rows}
     requested = [str(item).strip() for item in (payload.get("features") or []) if str(item).strip()]
-    invalid = [feature for feature in requested if feature not in mapping]
+    invalid = [feature for feature in requested if feature not in mapping and feature not in private]
     if invalid:
         raise HTTPException(status_code=422, detail=f"Features are not enabled in pinned QuantDB catalog: {', '.join(invalid[:8])}")
     if not requested:
         raise HTTPException(status_code=422, detail="At least one enabled QuantDB factor must be selected")
     pinned = dict(payload)
-    pinned["factor_field_sources"] = {feature: mapping[feature] for feature in requested}
+    pinned["factor_field_sources"] = {
+        feature: mapping[feature] for feature in requested if feature in mapping
+    }
     pinned["factor_schema_hash"] = status.schema_hash
     pinned["factor_catalog_published_at"] = str(version.published_at or "")
     pinned["factor_coverage"] = {"min_date": status.min_date, "max_date": status.max_date}
-    return pinned, list(mapping)
+    return pinned, list(dict.fromkeys([*mapping, *sorted(private)]))
 
 
 async def _apply_window_probe(payload: dict[str, Any], market: str) -> dict[str, Any]:
@@ -821,38 +832,152 @@ async def submit_training_job(
     payload: dict[str, Any],
     background_tasks: BackgroundTasks,
     current_user: dict[str, Any],
+    *,
+    idempotency_key: str | None = None,
+    factor_generation_map: dict[str, str] | None = None,
+    research_pipeline_id: str | None = None,
 ) -> dict[str, Any]:
     # 先解析目标市场（显式字段或 benchmark 推断），再按市场过滤可用特征
     context_raw = payload.get("context", {})
     context = context_raw if isinstance(context_raw, dict) else {}
     benchmark_hint = str(context.get("benchmark") or "SH000300").strip()
     market = _resolve_market(context.get("market"), benchmark_hint)
-    payload, allowed_features = await _resolve_quantdb_factor_payload(payload, market)
+    tenant_id = str(current_user.get("tenant_id") or "default")
+    user_id = str(current_user.get("user_id") or current_user.get("sub") or "unknown")
+    node_id = str(payload.get("node_id") or "local").strip() or "local"
+
+    private_dataset = None
+    private_generation_map: dict[str, str] = {}
+    if factor_generation_map is not None:
+        if not isinstance(factor_generation_map, dict) or not factor_generation_map:
+            raise HTTPException(status_code=422, detail="Pinned private factor mapping is invalid")
+        if market != "CN" or node_id != "local":
+            raise HTTPException(
+                status_code=422,
+                detail="Owner-private factor training currently requires the local CN training node",
+            )
+        from backend.services.engine.alpha_agent.user_factor_dataset import (
+            UserFactorDatasetUnavailable,
+            resolve_active_owner_factor_dataset,
+        )
+
+        try:
+            private_dataset = await resolve_active_owner_factor_dataset(
+                tenant_id,
+                user_id,
+                payload.get("features") or [],
+                expected_generation_map=factor_generation_map,
+                require_match=True,
+            )
+        except UserFactorDatasetUnavailable as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if private_dataset is None:
+            raise HTTPException(status_code=422, detail="Owner has no requested active private factor")
+        private_generation_map = private_dataset.feature_generation_by_column
+
+    payload, allowed_features = await _resolve_quantdb_factor_payload(
+        payload,
+        market,
+        private_features=set(private_generation_map),
+    )
     # 探针模式：窗口与切分来自数据本身（本地直读 / 远程 SSH 探针），
     # 与因子目录的草稿·发布状态无关；远程节点成段缺数据在此拦截。
     payload = await _apply_window_probe(payload, market)
     normalized_payload = _normalize_payload(payload, allowed_features)
-    run_id = f"train_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
-
-    tenant_id = str(current_user.get("tenant_id") or "default")
-    user_id = str(current_user.get("user_id") or current_user.get("sub") or "unknown")
+    key = str(idempotency_key or "").strip()
+    if key:
+        if len(key) > 128 or any(ord(char) < 32 or ord(char) == 127 for char in key):
+            raise HTTPException(status_code=422, detail="idempotency_key is invalid")
+        identity_json = json.dumps(
+            [tenant_id, user_id, "training_submit", key],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        run_id = "train_idem_" + hashlib.sha256(identity_json.encode()).hexdigest()[:32]
+    else:
+        run_id = f"train_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    if research_pipeline_id is not None:
+        pipeline_id = str(research_pipeline_id).strip()
+        if not pipeline_id or len(pipeline_id) > 64:
+            raise HTTPException(status_code=422, detail="research_pipeline_id is invalid")
+        normalized_payload["research_pipeline_id"] = pipeline_id
 
     # 身份注入：orchestrator 侧 resolve_training_pool 需要 tenant/user 来解析
     # 用户级私有池（global 池不需要，但带着无副作用）。
     normalized_payload["tenant_id"] = tenant_id
     normalized_payload["user_id"] = user_id
+    if private_dataset is not None:
+        normalized_payload["user_factor_generation_by_column"] = private_generation_map
+        normalized_payload["user_factor_features"] = list(private_dataset.feature_keys)
+        normalized_payload["user_factor_generation_id"] = private_dataset.generation_id
 
-    async with get_session() as session:
-        record = TrainingJobRecord(
-            id=run_id,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            status="pending",
-            request_payload=normalized_payload,
-            progress=0,
+    existing_record = None
+    try:
+        async with get_session() as session:
+            if key:
+                existing_record = (
+                    await session.execute(
+                        select(TrainingJobRecord).where(
+                            TrainingJobRecord.id == run_id,
+                            TrainingJobRecord.tenant_id == tenant_id,
+                            TrainingJobRecord.user_id == user_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+            if existing_record is None:
+                record = TrainingJobRecord(
+                    id=run_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    status="pending",
+                    request_payload=normalized_payload,
+                    progress=0,
+                )
+                session.add(record)
+                await session.commit()
+    except IntegrityError:
+        if not key:
+            raise
+        async with get_session(read_only=True) as session:
+            existing_record = (
+                await session.execute(
+                    select(TrainingJobRecord).where(
+                        TrainingJobRecord.id == run_id,
+                        TrainingJobRecord.tenant_id == tenant_id,
+                        TrainingJobRecord.user_id == user_id,
+                    )
+                )
+            ).scalar_one_or_none()
+        if existing_record is None:
+            raise
+
+    if existing_record is not None:
+        if existing_record.request_payload != normalized_payload:
+            raise HTTPException(
+                status_code=409,
+                detail="idempotency_key was already used with a different training request",
+            )
+        existing_payload = existing_record.request_payload or {}
+        private_keys = set(existing_payload.get("user_factor_features") or [])
+        valid_features, missing_features = LocalDockerOrchestrator._filter_features_by_parquet(
+            run_id, existing_payload.get("features", [])
         )
-        session.add(record)
-        await session.commit()
+        valid_features = [
+            feature for feature in existing_payload.get("features", [])
+            if feature in private_keys or feature in valid_features
+        ]
+        missing_features = [
+            feature for feature in existing_payload.get("features", [])
+            if feature not in private_keys and feature not in valid_features
+        ]
+        return {
+            "runId": run_id,
+            "status": existing_record.status,
+            "payload": existing_payload,
+            "validFeatureCount": len(valid_features),
+            "missingFeatureCount": len(missing_features),
+            "missingFeatures": missing_features[:30],
+        }
 
     _training_log_stream.append_log(
         run_id=run_id,
@@ -876,6 +1001,15 @@ async def submit_training_job(
     valid_features, missing_features = LocalDockerOrchestrator._filter_features_by_parquet(
         run_id, normalized_payload.get("features", [])
     )
+    private_keys = set(normalized_payload.get("user_factor_features") or [])
+    valid_features = [
+        feature for feature in normalized_payload.get("features", [])
+        if feature in private_keys or feature in valid_features
+    ]
+    missing_features = [
+        feature for feature in normalized_payload.get("features", [])
+        if feature not in private_keys and feature not in valid_features
+    ]
 
     return {
         "runId": run_id,

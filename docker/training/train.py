@@ -1069,6 +1069,11 @@ def main() -> int:
             # 中心 pin 的数据覆盖：训练窗口钳制的权威基准（远端数据独立初始化时
             # 靠它对齐时间切分，见 data/loading.py）
             factor_coverage=(cfg.get("data", {}) or {}).get("factor_coverage") or None,
+            user_factor_source_dir=(cfg.get("data", {}) or {}).get("user_factor_source_dir") or None,
+            user_factor_features=(cfg.get("data", {}) or {}).get("user_factor_features") or None,
+            user_factor_generation_by_column=(
+                cfg.get("data", {}) or {}
+            ).get("user_factor_generation_by_column") or None,
         )
 
         # 实际读到的数据覆盖：与 config 里 pin 的 coverage 对照，可事后核对
@@ -1276,6 +1281,17 @@ def main() -> int:
                 "factor_selection": factor_selection_report,
                 "features": valid_features,
                 "feature_columns": valid_features,
+                "user_factor_columns": [
+                    feature for feature in valid_features
+                    if feature in ((cfg.get("data", {}) or {}).get("user_factor_generation_by_column") or {})
+                ],
+                "user_factor_generation_by_column": {
+                    feature: generation
+                    for feature, generation in (
+                        (cfg.get("data", {}) or {}).get("user_factor_generation_by_column") or {}
+                    ).items()
+                    if feature in valid_features
+                },
                 "fill_values": fill_values,
                 "train_start": cfg["data"]["train_start"],
                 "train_end":   cfg["data"]["train_end"],
@@ -1489,6 +1505,17 @@ def main() -> int:
                 "factor_selection": factor_selection_report,
                 "features": valid_features,
                 "feature_columns": valid_features,
+                "user_factor_columns": [
+                    feature for feature in valid_features
+                    if feature in ((cfg.get("data", {}) or {}).get("user_factor_generation_by_column") or {})
+                ],
+                "user_factor_generation_by_column": {
+                    feature: generation
+                    for feature, generation in (
+                        (cfg.get("data", {}) or {}).get("user_factor_generation_by_column") or {}
+                    ).items()
+                    if feature in valid_features
+                },
                 "fill_values": fill_values,
                 "train_start": cfg["data"]["train_start"],
                 "train_end":   cfg["data"]["train_end"],

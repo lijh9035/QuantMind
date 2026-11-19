@@ -1379,7 +1379,7 @@ class AlphaFactorJobPersistence:
                 locked_job = (
                     session.execute(
                         text(
-                            "SELECT kind,request_snapshot,progress_snapshot,created_at "
+                            "SELECT kind,request_snapshot,progress_snapshot,created_at,parent_task_id "
                             "FROM alpha_factor_jobs "
                             "WHERE job_id=:job AND tenant_id=:tenant AND user_id=:user "
                             "AND execution_generation=:generation AND status='running' FOR UPDATE"
@@ -1474,7 +1474,7 @@ class AlphaFactorJobPersistence:
                         archived_generation = session.execute(
                             text(
                                 "UPDATE alpha_user_factor_generations SET "
-                                "status='archived' "
+                                "status='archived',updated_at=now() "
                                 "WHERE tenant_id=:tenant AND user_id=:user "
                                 "AND generation_id=:generation AND job_id=:job "
                                 "AND status='building' AND dataset_key='rd_mined'"
@@ -1601,7 +1601,7 @@ class AlphaFactorJobPersistence:
                         updated_generation = session.execute(
                             text(
                                 "UPDATE alpha_user_factor_generations SET "
-                                "status='published',manifest_json=CAST(:manifest AS jsonb),"
+                                "status='published',updated_at=now(),manifest_json=CAST(:manifest AS jsonb),"
                                 "row_count=:rows,byte_count=:bytes,published_at=now() "
                                 "WHERE tenant_id=:tenant AND user_id=:user "
                                 "AND generation_id=:generation AND job_id=:job "
@@ -1645,8 +1645,8 @@ class AlphaFactorJobPersistence:
                             text(
                                 "INSERT INTO alpha_user_factor_generation_features "
                                 "(tenant_id,user_id,generation_id,feature_key,factor_id,"
-                                "factor_code_sha256,factor_revision_no,row_count) VALUES "
-                                "(:tenant,:user,:generation,:feature,:factor,:sha,:revision,:rows)"
+                                "factor_code_sha256,factor_revision_no,row_count,source_task_id) VALUES "
+                                "(:tenant,:user,:generation,:feature,:factor,:sha,:revision,:rows,:source_task)"
                             ),
                             {
                                 "tenant": owner.tenant_id,
@@ -1657,6 +1657,18 @@ class AlphaFactorJobPersistence:
                                 "sha": result["factor_code_sha256"],
                                 "revision": result["factor_revision_no"],
                                 "rows": result["row_count"],
+                                "source_task": next(
+                                    (
+                                        value.strip()
+                                        for value in (
+                                            request_body.get("statistical_task_id"),
+                                            request_body.get("research_task_id"),
+                                            locked_job["parent_task_id"],
+                                        )
+                                        if isinstance(value, str) and value.strip()
+                                    ),
+                                    None,
+                                ),
                             },
                         )
                         session.execute(
@@ -1675,7 +1687,7 @@ class AlphaFactorJobPersistence:
                         )
                         session.execute(
                             text(
-                                "UPDATE alpha_user_factor_generations SET status='archived' "
+                                "UPDATE alpha_user_factor_generations SET status='archived',updated_at=now() "
                                 "WHERE tenant_id=:tenant AND user_id=:user "
                                 "AND dataset_key='rd_mined' AND status='published' "
                                 "AND generation_id<>:generation"
@@ -1701,7 +1713,7 @@ class AlphaFactorJobPersistence:
                     else:
                         session.execute(
                             text(
-                                "UPDATE alpha_user_factor_generations SET status='failed' "
+                                "UPDATE alpha_user_factor_generations SET status='failed',updated_at=now() "
                                 "WHERE tenant_id=:tenant AND user_id=:user "
                                 "AND generation_id=:generation AND job_id=:job "
                                 "AND status='building'"
@@ -1801,7 +1813,7 @@ class AlphaFactorJobPersistence:
                 )
             session.execute(
                 text(
-                    "UPDATE alpha_user_factor_generations SET status='archived' "
+                    "UPDATE alpha_user_factor_generations SET status='archived',updated_at=now() "
                     "WHERE tenant_id=:tenant AND user_id=:user AND job_id=:job "
                     "AND dataset_key='rd_mined' AND status='building'"
                 ),

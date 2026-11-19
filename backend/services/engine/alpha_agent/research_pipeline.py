@@ -563,6 +563,11 @@ async def _advance(row: dict) -> None:
             }
             for item in factors
         ]
+        # The OSS active registry carries one generation per owner+dataset, so
+        # this pipeline trains only the top-ranked candidate in that generation.
+        snapshot["training_factor_id"] = (
+            snapshot["factors"][0]["factor_id"] if snapshot["factors"] else None
+        )
         snapshot["materialization_ids"] = {}
         await store.save(
             row,
@@ -573,7 +578,14 @@ async def _advance(row: dict) -> None:
         return
 
     generations = {}
-    for factor in snapshot["factors"]:
+    training_factor_id = snapshot.get("training_factor_id")
+    training_factors = [
+        factor for factor in snapshot["factors"]
+        if factor.get("factor_id") == training_factor_id
+    ]
+    if not training_factors and snapshot["factors"]:
+        training_factors = snapshot["factors"][:1]
+    for factor in training_factors:
         factor_id = factor["factor_id"]
         child_id = snapshot["materialization_ids"].get(factor_id)
         if not child_id:
@@ -610,6 +622,29 @@ async def _advance(row: dict) -> None:
         ):
             raise ValueError("Materialization did not publish the selected formula")
         generations[result["feature_key"]] = result["generation_id"]
+    if generations and "training_id" not in snapshot:
+        # The OSS contract has one active generation per owner+dataset. Earlier
+        # factors in this loop are archived as later factors publish, so only
+        # the current active generation may be offered to training.
+        from backend.services.engine.alpha_agent.user_factor_dataset import (
+            UserFactorDatasetUnavailable,
+            resolve_active_owner_factor_dataset,
+        )
+
+        try:
+            active_dataset = await resolve_active_owner_factor_dataset(
+                owner.tenant_id,
+                owner.user_id,
+                requested_features=list(generations),
+                require_match=False,
+            )
+        except UserFactorDatasetUnavailable as exc:
+            raise RuntimeError("Active private factor generation is not readable") from exc
+        if active_dataset is None:
+            raise RuntimeError(
+                "No selected private factor remains in the owner's active generation"
+            )
+        generations = active_dataset.feature_generation_by_column
     if "training_id" not in snapshot:
         snapshot["generation_map"] = generations
         snapshot["training_key"] = _key(run_id, "training")

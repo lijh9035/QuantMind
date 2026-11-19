@@ -83,6 +83,38 @@ def user_dataset_dir(dataset: str = _DEFAULT_SOURCE) -> Path:
     return factor_source_dir(dataset, market="CUSTOM")
 
 
+def quantcustom_root() -> Path:
+    """用户自定义数据根目录，供 owner-scoped 私有因子代次使用。
+
+    This is the same ``QM_QUANTCUSTOM_DATA_DIR`` root used by the quota-managed
+    materialization writer. Private generations live below ``users/`` and must
+    not be redirected into the shared ``6_ml_datasets`` tree.
+    """
+    return market_data_dir("CUSTOM")
+
+
+def user_factor_dataset_dir(
+    tenant_id: str,
+    user_id: str,
+    dataset: str = "rd_mined",
+    *,
+    generation_id: str,
+) -> Path:
+    """Return one owner-scoped immutable factor generation directory.
+
+    The owner and generation segments are validated before path construction.
+    This helper deliberately supports only the private ``rd_mined`` dataset;
+    shared QuantDB datasets continue to use :func:`factor_source_dir`.
+    """
+    from backend.shared.owner_path import owner_segment, user_scoped_dir
+
+    if dataset != "rd_mined":
+        raise ValueError("Only owner-scoped rd_mined generations are supported")
+    generation = owner_segment(generation_id)
+    owner_root = user_scoped_dir(quantcustom_root() / "users", tenant_id, user_id)
+    return owner_root / "factor_generations" / generation / "6_ml_datasets" / dataset
+
+
 def list_factor_partitions(
     source: str = _DEFAULT_SOURCE, market: str = "CN"
 ) -> list[Path]:

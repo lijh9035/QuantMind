@@ -518,6 +518,10 @@ class LocalDockerOrchestrator(TrainingOrchestrator):
         # 强制使用本地数据，不回落到 COS 下载
         data_source_mode = payload.get("data_source_mode", "LOCAL")
         factor_source = str(payload.get("factor_source") or "").strip()
+        user_factor_generation_map = dict(
+            payload.get("user_factor_generation_by_column") or {}
+        )
+        user_factor_features = list(user_factor_generation_map)
 
         # 直读模式按选定的单一 QuantDB 因子源过滤；旧模型仍走快照兼容路径。
         requested_features = payload.get("features", [])
@@ -540,11 +544,13 @@ class LocalDockerOrchestrator(TrainingOrchestrator):
                 field_sources = dict(payload.get("factor_field_sources") or {})
                 valid_features = [
                     feature for feature in requested_features
-                    if field_sources.get(feature, feature) in available
+                    if feature in user_factor_generation_map
+                    or field_sources.get(feature, feature) in available
                 ]
                 missing_features = [
                     feature for feature in requested_features
-                    if field_sources.get(feature, feature) not in available
+                    if feature not in user_factor_generation_map
+                    and field_sources.get(feature, feature) not in available
                 ]
             except Exception as exc:
                 raise RuntimeError(f"QuantDB factor source {factor_source} is not ready: {exc}") from exc
@@ -552,6 +558,15 @@ class LocalDockerOrchestrator(TrainingOrchestrator):
             valid_features, missing_features = self._filter_features_by_parquet(
                 run_id, requested_features
             )
+            valid_features = [
+                feature
+                for feature in requested_features
+                if feature in user_factor_generation_map or feature in valid_features
+            ]
+            missing_features = [
+                feature for feature in requested_features
+                if feature not in user_factor_generation_map and feature not in valid_features
+            ]
         if missing_features:
             logger.warning(
                 "[%s] %d/%d requested features not in parquet, filtered out: %s...",
@@ -623,6 +638,11 @@ class LocalDockerOrchestrator(TrainingOrchestrator):
                     factor_catalog_published_at=str(payload.get("factor_catalog_published_at") or "") or None,
                     factor_coverage=dict(payload.get("factor_coverage") or {}),
                     quantdb_dir=market_mount_dir if factor_source else None,
+                    user_factor_source_dir=(
+                        "/private_factors/rd_mined" if user_factor_generation_map else None
+                    ),
+                    user_factor_features=user_factor_features,
+                    user_factor_generation_by_column=user_factor_generation_map,
                     # 全局股票池（P3）：容器无 DB，池成分在这里解析后传入
                     **_training_pool_fields(payload),
                 ),
@@ -804,6 +824,27 @@ class LocalDockerOrchestrator(TrainingOrchestrator):
         volumes: dict[str, dict[str, str]] = {
             str(host_output_dir): {"bind": "/workspace", "mode": "rw"},
         }
+        private_generation_map = dict(
+            payload.get("user_factor_generation_by_column") or {}
+        )
+        if private_generation_map:
+            generation_ids = {str(value) for value in private_generation_map.values()}
+            if len(generation_ids) != 1 or not tenant_id or not user_id:
+                raise RuntimeError("Pinned private factor owner/generation is invalid")
+            from backend.shared.feature_source import user_factor_dataset_dir
+
+            private_root = user_factor_dataset_dir(
+                tenant_id,
+                user_id,
+                "rd_mined",
+                generation_id=next(iter(generation_ids)),
+            )
+            if private_root.is_symlink() or not private_root.is_dir():
+                raise RuntimeError("Pinned private factor generation is unavailable")
+            volumes[_market_host_path(str(private_root))] = {
+                "bind": "/private_factors/rd_mined",
+                "mode": "ro",
+            }
         if not config.get("data", {}).get("factor_source"):
             volumes[str(_LOCAL_DATA_PATH)] = {"bind": _LOCAL_DATA_MOUNT_DIR, "mode": "ro"}
         # 挂载 QuantDB 全量数据（6大类：kline/base_sector/financial/bond_etf/technical_derived/ml_datasets）

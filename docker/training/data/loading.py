@@ -72,6 +72,120 @@ def _pool_symbol_mask(symbols: pd.Series, pool_symbols: list[str]) -> pd.Series:
     return symbols.map(_symbol_core).isin(wanted)
 
 
+def _read_owner_factor_generation(
+    root: str | Path,
+    feature_keys: list[str],
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Read only the API-pinned, read-only mounted private generation."""
+    root_path = Path(root)
+    if not root_path.is_absolute() or root_path.is_symlink() or not root_path.is_dir():
+        raise RuntimeError("Pinned private factor directory is unavailable")
+    resolved_root = root_path.resolve(strict=True)
+    if not feature_keys or any(not isinstance(key, str) or not key.strip() for key in feature_keys):
+        raise RuntimeError("Pinned private factor feature mapping is invalid")
+
+    selected: list[Path] = []
+    for path in sorted(root_path.glob("dt=*/data.parquet")):
+        if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
+            raise RuntimeError("Pinned private factor partition is unsafe")
+        partition_name = path.parent.name
+        if not partition_name.startswith("dt=") or len(partition_name) != 11:
+            raise RuntimeError("Pinned private factor partition name is invalid")
+        try:
+            partition_date = pd.to_datetime(partition_name[3:], format="%Y%m%d")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Pinned private factor partition date is invalid") from exc
+        if start.normalize() <= partition_date <= end.normalize():
+            if not path.resolve(strict=True).is_relative_to(resolved_root):
+                raise RuntimeError("Pinned private factor partition escaped its generation")
+            selected.append(path)
+    if not selected:
+        raise RuntimeError("Pinned private factor has no partitions in the training window")
+
+    pieces: list[pd.DataFrame] = []
+    expected_columns = {"symbol", "trade_date", *feature_keys}
+    for path in selected:
+        try:
+            schema = set(pq.ParquetFile(str(path)).schema_arrow.names)
+            if not expected_columns.issubset(schema):
+                raise RuntimeError("Pinned private factor schema does not match its mapping")
+            piece = pd.read_parquet(
+                path, columns=["symbol", "trade_date", *feature_keys], engine="pyarrow"
+            )
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("Pinned private factor partition could not be read") from exc
+        piece["trade_date"] = pd.to_datetime(piece["trade_date"], errors="coerce").dt.normalize()
+        if piece["trade_date"].isna().any():
+            raise RuntimeError("Pinned private factor has invalid trade dates")
+        expected_date = pd.to_datetime(path.parent.name[3:], format="%Y%m%d")
+        if not piece["trade_date"].eq(expected_date).all():
+            raise RuntimeError("Pinned private factor rows do not match their date partition")
+        if piece["symbol"].isna().any() or piece.duplicated(["symbol", "trade_date"]).any():
+            raise RuntimeError("Pinned private factor has invalid symbol/date keys")
+        for feature in feature_keys:
+            piece[feature] = pd.to_numeric(piece[feature], errors="coerce")
+            piece[feature] = piece[feature].replace([np.inf, -np.inf], np.nan)
+        pieces.append(piece)
+
+    private = pd.concat(pieces, ignore_index=True)
+    private = private[
+        (private["trade_date"] >= start.normalize())
+        & (private["trade_date"] <= end.normalize())
+    ].copy()
+    if private.empty:
+        raise RuntimeError("Pinned private factor has no rows in the training window")
+    if any(int(private[feature].notna().sum()) == 0 for feature in feature_keys):
+        raise RuntimeError("Pinned private factor contains no usable numeric values")
+    private["_symbol_core"] = private["symbol"].map(_symbol_core)
+    if private.duplicated(["_symbol_core", "trade_date"]).any():
+        raise RuntimeError("Pinned private factor has duplicate normalized symbol/date keys")
+    return private[["_symbol_core", "trade_date", *feature_keys]]
+
+
+def _merge_owner_factor_generation(
+    base: pd.DataFrame,
+    root: str | Path,
+    feature_keys: list[str],
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    private = _read_owner_factor_generation(
+        root, feature_keys, start=start, end=end
+    )
+    if "symbol" not in base.columns or "trade_date" not in base.columns:
+        raise RuntimeError("Base training data is missing symbol/trade_date keys")
+    collisions = [feature for feature in feature_keys if feature in base.columns]
+    if collisions:
+        raise RuntimeError("Private factor columns conflict with the selected base source")
+    joined = base.copy()
+    joined["trade_date"] = pd.to_datetime(joined["trade_date"], errors="coerce").dt.normalize()
+    if joined["trade_date"].isna().any() or joined["symbol"].isna().any():
+        raise RuntimeError("Base training data has invalid symbol/date keys")
+    joined["_symbol_core"] = joined["symbol"].map(_symbol_core)
+    if joined.duplicated(["_symbol_core", "trade_date"]).any():
+        raise RuntimeError("Base training data has duplicate normalized symbol/date keys")
+    joined = joined.merge(
+        private,
+        on=["_symbol_core", "trade_date"],
+        how="left",
+        validate="one_to_one",
+    ).drop(columns=["_symbol_core"])
+    non_null = {feature: int(joined[feature].notna().sum()) for feature in feature_keys}
+    if any(count <= 0 for count in non_null.values()):
+        raise RuntimeError("Private factor does not align to any base training rows")
+    logger.info(
+        "Owner private factor generation merged: rows=%d features=%d non_null=%s",
+        len(joined), len(feature_keys), non_null,
+    )
+    return joined
+
+
 def _load_local_parquet(
     local_dir: Path,
     year: int,
@@ -165,6 +279,9 @@ def load_data(
     factor_field_sources: dict[str, str] | None = None,
     pool_symbols: list[str] | None = None,
     factor_coverage: dict | None = None,
+    user_factor_source_dir: str | None = None,
+    user_factor_features: list[str] | None = None,
+    user_factor_generation_by_column: dict[str, str] | None = None,
 ) -> tuple:
     local_root = Path(local_dir).expanduser() if local_dir else None
     if local_root is None:
@@ -198,6 +315,22 @@ def load_data(
     range_end = pd.Timestamp(upper_bound) + pd.Timedelta(days=max(7, horizon + 3))
 
     direct_factor_source = str(factor_source or "").strip()
+    private_features = list(
+        dict.fromkeys(
+            str(item).strip()
+            for item in (user_factor_features or [])
+            if str(item).strip()
+        )
+    )
+    private_generation_map = dict(user_factor_generation_by_column or {})
+    if private_features:
+        if not user_factor_source_dir:
+            raise RuntimeError("Pinned private factor source directory is missing")
+        if set(private_features) != set(private_generation_map):
+            raise RuntimeError("Pinned private factor generation mapping is incomplete")
+        if any(not str(value).strip() for value in private_generation_map.values()):
+            raise RuntimeError("Pinned private factor generation mapping is invalid")
+
     if direct_factor_source and market_upper in _MARKET_DATA_DIR_ENV:
         # Direct QuantDB mode: one factor source only, never materialise or merge snapshots.
         # 与 A 股一致：直接读该市场 6_ml_datasets 下的因子分区
@@ -275,9 +408,10 @@ def load_data(
             range_start.date(),
             range_end.date(),
         )
+        source_features = [feature for feature in features if feature not in private_features]
         df = reader.read_range(
             direct_factor_source,
-            features=features,
+            features=source_features,
             feature_sources=factor_field_sources,
             start=range_start.date(),
             end=range_end.date(),
@@ -498,6 +632,15 @@ def load_data(
                     logger.warning("instrument_detail.parquet not found (searched: %s)", ", ".join(str(d) for d in _sector_dirs))
             except Exception as e:
                 logger.warning("Failed to merge industry data (non-fatal): %s", e)
+
+    if private_features:
+        df = _merge_owner_factor_generation(
+            df,
+            user_factor_source_dir,
+            private_features,
+            start=range_start,
+            end=range_end,
+        )
 
     # ── 过滤北交所（4/8 开头，仅 A 股） ──
     # 必须在所有加载分支之后：此前缩在 CN-parquet 分支内，直读因子源模式
