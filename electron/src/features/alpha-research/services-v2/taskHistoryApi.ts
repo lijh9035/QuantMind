@@ -85,6 +85,16 @@ export interface MiningTaskResult {
 
 export interface AlphaSageMiningResult {
   candidate_count?: number;
+  persisted_count?: number;
+  duplicate_skipped_count?: number;
+  duplicate_skips?: Array<{
+    candidate_factor_id: string;
+    candidate_factor_name?: string;
+    matched_factor_id: string;
+    matched_factor_name?: string;
+    scope: 'owner_library' | 'same_submission';
+    reason: 'exact_expression';
+  }>;
   training_window?: {
     requested_start?: string;
     requested_end?: string;

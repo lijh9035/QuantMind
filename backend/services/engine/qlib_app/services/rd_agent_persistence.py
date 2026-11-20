@@ -1558,19 +1558,8 @@ class AlphaMiningTaskPersistence:
             raise ValueError("AlphaSAGE result identity is invalid")
         if not isinstance(factors, list) or len(factors) > 128:
             raise ValueError("AlphaSAGE factor count exceeds its supported bound")
-        encoded_result = json.dumps(
-            result,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        if len(encoded_result.encode("utf-8")) > max_bytes:
-            raise ValueError("AlphaSAGE result exceeds the storage limit")
-
         validated: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
-        seen_expressions: set[str] = set()
         for factor in factors:
             required = {
                 "factor_id",
@@ -1601,7 +1590,6 @@ class AlphaMiningTaskPersistence:
                 or not isinstance(factor_code, str)
                 or not factor_code.startswith("fm:")
                 or len(factor_code) > 8192
-                or factor_code in seen_expressions
                 or not isinstance(factor["factor_formulation"], str)
                 or len(factor["factor_formulation"]) > 2000
                 or factor["market"] != "a_share"
@@ -1659,11 +1647,31 @@ class AlphaMiningTaskPersistence:
             if len(encoded_metadata.encode("utf-8")) > 256 * 1024:
                 raise ValueError("AlphaSAGE factor metadata exceeds 256 KiB")
             seen_ids.add(factor["factor_id"])
-            seen_expressions.add(factor_code)
             validated.append({**factor, "metadata_json": encoded_metadata})
 
         if result.get("persisted_count") != len(validated):
             raise ValueError("AlphaSAGE persisted factor count does not match result")
+
+        if not isinstance(result.get("rejections", []), list):
+            raise ValueError("AlphaSAGE rejection summary is invalid")
+        if not isinstance(result.get("duplicate_skips", []), list):
+            raise ValueError("AlphaSAGE duplicate summary is invalid")
+        input_digest_payload = {
+            "result": result,
+            "factors": sorted(
+                (factor["factor_id"], factor["factor_code"])
+                for factor in validated
+            ),
+        }
+        input_digest = hashlib.sha256(
+            json.dumps(
+                input_digest_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
 
         async with get_session() as session:
             task = (
@@ -1712,14 +1720,102 @@ class AlphaMiningTaskPersistence:
                 if (
                     existing is not None
                     and existing["execution_fingerprint"] == execution_fingerprint
-                    and existing["result_json"] == result
+                    and isinstance(existing["result_json"], dict)
+                    and (
+                        existing["result_json"].get("_persistence_input_sha256")
+                        == input_digest
+                        or existing["result_json"] == result
+                    )
                 ):
+                    result.clear()
+                    result.update(existing["result_json"])
                     return False
                 raise RuntimeError("A different AlphaSAGE result already exists")
             if task["status"] != "running":
                 raise ValueError("AlphaSAGE task is not in a result-persistable state")
 
+            await session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"
+                ),
+                {
+                    "lock_key": (
+                        f"quantmind:alphasage-factor-dedup:{owner.tenant_id}:"
+                        f"{owner.user_id}"
+                    )
+                },
+            )
+
+            existing_by_code: dict[str, dict[str, Any]] = {}
+            factor_codes = sorted({factor["factor_code"] for factor in validated})
+            if factor_codes:
+                existing_rows = await session.execute(
+                    text(
+                        "SELECT factor_id,factor_name,factor_code "
+                        "FROM rd_agent_factors WHERE tenant_id=:tenant_id "
+                        "AND user_id=:user_id "
+                        "AND factor_code=ANY(CAST(:factor_codes AS TEXT[])) "
+                        "ORDER BY created_at ASC,factor_id ASC"
+                    ),
+                    {**owner.sql_params(), "factor_codes": factor_codes},
+                )
+                for row in existing_rows.mappings().all():
+                    existing_by_code.setdefault(str(row["factor_code"]), dict(row))
+
+            duplicate_skips = list(result.get("duplicate_skips") or [])
+            rejections = list(result.get("rejections") or [])
+            accepted: list[dict[str, Any]] = []
+            accepted_by_code: dict[str, dict[str, Any]] = {}
             for factor in validated:
+                expression = factor["factor_code"]
+                matched = existing_by_code.get(expression) or accepted_by_code.get(
+                    expression
+                )
+                if matched is not None:
+                    same_submission = expression not in existing_by_code
+                    duplicate = {
+                        "candidate_factor_id": factor["factor_id"],
+                        "candidate_factor_name": factor["factor_name"],
+                        "matched_factor_id": matched["factor_id"],
+                        "matched_factor_name": matched["factor_name"],
+                        "scope": "same_submission" if same_submission else "owner_library",
+                        "reason": "exact_expression",
+                    }
+                    duplicate_skips.append(duplicate)
+                    rejections.append(
+                        {
+                            "source_index": factor["metadata"].get("source_index"),
+                            "reason": "duplicate_canonical_expression",
+                            "matched_factor_id": matched["factor_id"],
+                        }
+                    )
+                    continue
+                accepted.append(factor)
+                accepted_by_code[expression] = {
+                    "factor_id": factor["factor_id"],
+                    "factor_name": factor["factor_name"],
+                }
+
+            result["duplicate_skips"] = duplicate_skips[:128]
+            result["duplicate_skipped_count"] = len(duplicate_skips)
+            result["rejections"] = rejections[:128]
+            result["rejected_count"] = len(rejections)
+            result["persisted_count"] = len(accepted)
+            result["status"] = (
+                "completed" if accepted else "completed_with_zero_factors"
+            )
+            result["_persistence_input_sha256"] = input_digest
+            encoded_result = json.dumps(
+                result,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if len(encoded_result.encode("utf-8")) > max_bytes:
+                raise ValueError("AlphaSAGE result exceeds the storage limit")
+
+            for factor in accepted:
                 inserted_factor = await session.execute(
                     text(
                         "INSERT INTO rd_agent_factors "
@@ -1808,7 +1904,7 @@ class AlphaMiningTaskPersistence:
             updated = await session.execute(
                 text(
                     "UPDATE alpha_mining_tasks SET status='completed', "
-                    "phase='completed', progress='AlphaSAGE 因子转换、评价与入库完成', "
+                    "phase='completed', progress=:progress, "
                     "progress_pct=100, completed_at=COALESCE(completed_at,now()), "
                     "updated_at=now() WHERE task_id=:task AND tenant_id=:tenant_id "
                     "AND user_id=:user_id AND status='running' "
@@ -1818,6 +1914,10 @@ class AlphaMiningTaskPersistence:
                     **owner.sql_params(),
                     "task": task_id,
                     "fingerprint": execution_fingerprint,
+                    "progress": (
+                        f"AlphaSAGE 入库完成：新增 {len(accepted)} 个，"
+                        f"跳过完全重复 {len(duplicate_skips)} 个"
+                    ),
                 },
             )
             if updated.rowcount != 1:

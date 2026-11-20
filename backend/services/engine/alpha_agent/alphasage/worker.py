@@ -833,7 +833,8 @@ async def run_alphasage_queued(
                 factors: list[dict[str, Any]] = []
                 summaries: list[dict[str, Any]] = []
                 rejections: list[dict[str, Any]] = []
-                seen_expressions: set[str] = set()
+                duplicate_skips: list[dict[str, Any]] = []
+                seen_expressions: dict[str, dict[str, str]] = {}
                 for candidate in candidates:
                     if not isinstance(candidate, dict):
                         rejections.append({"reason": "invalid_candidate_record"})
@@ -853,14 +854,26 @@ async def run_alphasage_queued(
                         continue
                     expression = factor["factor_code"]
                     if expression in seen_expressions:
-                        rejections.append(
-                            {
-                                "source_index": candidate.get("source_index"),
-                                "reason": "duplicate_canonical_expression",
-                            }
-                        )
+                        matched = seen_expressions[expression]
+                        duplicate = {
+                            "candidate_factor_id": factor["factor_id"],
+                            "candidate_factor_name": factor["factor_name"],
+                            "matched_factor_id": matched["factor_id"],
+                            "matched_factor_name": matched["factor_name"],
+                            "scope": "same_submission",
+                            "reason": "exact_expression",
+                        }
+                        duplicate_skips.append(duplicate)
+                        rejections.append({
+                            "source_index": candidate.get("source_index"),
+                            "reason": "duplicate_canonical_expression",
+                            "matched_factor_id": matched["factor_id"],
+                        })
                         continue
-                    seen_expressions.add(expression)
+                    seen_expressions[expression] = {
+                        "factor_id": factor["factor_id"],
+                        "factor_name": factor["factor_name"],
+                    }
                     factors.append(factor)
                     summaries.append(summary)
 
@@ -888,6 +901,8 @@ async def run_alphasage_queued(
                     "converted_and_evaluated_count": len(factors),
                     "persisted_count": len(factors),
                     "rejected_count": len(rejections),
+                    "duplicate_skipped_count": len(duplicate_skips),
+                    "duplicate_skips": duplicate_skips,
                     "candidates": summaries,
                     "rejections": rejections[:_MAX_CANDIDATES],
                     "validation_used_for_search": False,
@@ -905,7 +920,10 @@ async def run_alphasage_queued(
                 )
                 task.status = TaskStatus.COMPLETED
                 task.phase = "completed"
-                task.progress = "AlphaSAGE 因子转换、评价与入库完成"
+                task.progress = (
+                    f"AlphaSAGE 入库完成：新增 {result_snapshot.get('persisted_count', 0)} 个，"
+                    f"跳过完全重复 {result_snapshot.get('duplicate_skipped_count', 0)} 个"
+                )
                 task.progress_pct = 100
                 task.result = result_snapshot
                 return

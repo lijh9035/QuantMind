@@ -596,21 +596,41 @@ export const TaskCenterPage: React.FC = () => {
               <div className="rounded-lg border border-border/50 p-3 text-xs">
                 <div className="font-medium mb-1.5">AlphaSAGE GNN 训练结果</div>
                 {details.alphaSageResult ? (
-                  <p className="text-muted-foreground">
-                    候选表达式 {details.alphaSageResult.candidate_count ?? details.alphaSageResult.candidates?.length ?? '—'} 个
-                    {details.alphaSageResult.training_window?.requested_start && details.alphaSageResult.training_window.requested_end
-                      ? ` · 挖掘窗 ${details.alphaSageResult.training_window.requested_start} 至 ${details.alphaSageResult.training_window.requested_end}`
-                      : ''}
-                    {details.alphaSageResult.training_window?.mature_label_end
-                      ? ` · 成熟训练标签截止 ${details.alphaSageResult.training_window.mature_label_end}`
-                      : ''}
-                    {details.alphaSageResult.validation_window?.start && details.alphaSageResult.validation_window.end
-                      ? ` · 独立验证窗 ${details.alphaSageResult.validation_window.start} 至 ${details.alphaSageResult.validation_window.end}`
-                      : ''}
-                    {details.alphaSageResult.validation_window?.evaluated === true
-                      ? ' · 验证已评估'
-                      : ' · 验证结果尚未记录'}
-                  </p>
+                  <>
+                    <p className="text-muted-foreground">
+                      候选表达式 {details.alphaSageResult.candidate_count ?? details.alphaSageResult.candidates?.length ?? '—'} 个
+                      {details.alphaSageResult.training_window?.requested_start && details.alphaSageResult.training_window.requested_end
+                        ? ` · 挖掘窗 ${details.alphaSageResult.training_window.requested_start} 至 ${details.alphaSageResult.training_window.requested_end}`
+                        : ''}
+                      {details.alphaSageResult.training_window?.mature_label_end
+                        ? ` · 成熟训练标签截止 ${details.alphaSageResult.training_window.mature_label_end}`
+                        : ''}
+                      {details.alphaSageResult.validation_window?.start && details.alphaSageResult.validation_window.end
+                        ? ` · 独立验证窗 ${details.alphaSageResult.validation_window.start} 至 ${details.alphaSageResult.validation_window.end}`
+                        : ''}
+                      {details.alphaSageResult.validation_window?.evaluated === true
+                        ? ' · 验证已评估'
+                        : ' · 验证结果尚未记录'}
+                    </p>
+                    <p className="mt-1 text-muted-foreground">
+                      本次新增入库 {details.alphaSageResult.persisted_count ?? details.factors.length} 个
+                      {' · '}完全相同跳过 {details.alphaSageResult.duplicate_skipped_count ?? details.alphaSageResult.duplicate_skips?.length ?? 0} 个
+                    </p>
+                    {(details.alphaSageResult.duplicate_skipped_count ?? details.alphaSageResult.duplicate_skips?.length ?? 0) > 0 && (
+                      <div role="status" aria-live="polite" className="mt-2 rounded-md border border-amber-300 bg-amber-50 p-2 text-amber-900">
+                        <div className="font-medium">以下公式与已有因子完全相同，已跳过，没有重复入库：</div>
+                        <ul className="mt-1 max-h-32 space-y-1 overflow-auto">
+                          {(details.alphaSageResult.duplicate_skips ?? []).map((duplicate) => (
+                            <li key={`${duplicate.candidate_factor_id}:${duplicate.matched_factor_id}`} className="break-all">
+                            {duplicate.candidate_factor_name || '候选因子'} ({duplicate.candidate_factor_id})
+                            {' 与 '}{duplicate.matched_factor_name || '已存因子'} ({duplicate.matched_factor_id})
+                              {duplicate.scope === 'owner_library' ? '（本人已存因子）' : '（本次候选）'}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </>
                 ) : <p className="text-muted-foreground">结果尚不可用；请确认任务已完成后刷新详情。</p>}
               </div>
             )}
