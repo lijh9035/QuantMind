@@ -12,7 +12,7 @@
 
 import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useDebounce } from '../../../hooks/useDebounce';
-import { SERVICE_ENDPOINTS } from '../../../config/services';
+import { SERVICE_URLS } from '../../../config/services';
 import {
   Badge,
   Button,
@@ -86,6 +86,27 @@ const COLOR_BEARISH = '#16a34a';
 const COLOR_NEUTRAL = '#64748b';
 
 const LS_KEY = 'news_panel_filters';
+
+/** Huntly 的 SPA 只能从站点根路径运行；其 Docker 端口仅绑定本机回环地址。 */
+function resolveHuntlyAdminUrl(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const base = SERVICE_URLS.USER_SERVICE || window.location.origin;
+    const url = new URL(base, window.location.origin);
+    const hostname = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    if (!['localhost', '127.0.0.1', '::1'].includes(hostname)) return null;
+
+    const port = String((import.meta as any).env?.VITE_HUNTLY_PORT || '8090').trim();
+    url.protocol = 'http:';
+    url.port = port;
+    url.pathname = '/';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
 
 interface FilterState {
   feedMode: FeedMode;
@@ -208,6 +229,7 @@ function countActiveFilters(f: FilterState): number {
 }
 
 export const NewsPanel: React.FC = () => {
+  const huntlyAdminUrl = resolveHuntlyAdminUrl();
   // —— persisted filter state ——
   const [f, setF] = useState<FilterState>(loadFilters);
   const [debouncedKeyword] = useDebounce(f.keyword, 300);
@@ -756,9 +778,9 @@ export const NewsPanel: React.FC = () => {
               <Tooltip title="一键清理超过 24 小时的资讯（不可恢复）">
                 <Button size="small" danger icon={<DeleteOutlined />} loading={purging} onClick={handlePurgeOld}>清理</Button>
               </Tooltip>
-              {health?.huntly_base_url && (
+              {health?.huntly_base_url && huntlyAdminUrl && (
                 <Tooltip title="Huntly 后台">
-                  <a href={`${SERVICE_ENDPOINTS.USER_SERVICE}/news/huntly-ui/`} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#6366f1', whiteSpace: 'nowrap' }}>
+                  <a href={huntlyAdminUrl} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#6366f1', whiteSpace: 'nowrap' }}>
                     <LinkOutlined /> 后台
                   </a>
                 </Tooltip>
