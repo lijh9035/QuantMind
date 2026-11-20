@@ -93,6 +93,14 @@ services:
       - TZ=Asia/Shanghai
       - PYTHONPATH=/app
 
+      # 可选的 WSL2 出站代理，仅配置 QuantMind 核心容器；内部服务与本机 Ollama 走直连。
+      - "HTTP_PROXY=${QUANTMIND_DOCKER_PROXY:-}"
+      - "HTTPS_PROXY=${QUANTMIND_DOCKER_PROXY:-}"
+      - "http_proxy=${QUANTMIND_DOCKER_PROXY:-}"
+      - "https_proxy=${QUANTMIND_DOCKER_PROXY:-}"
+      - "NO_PROXY=${QUANTMIND_DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,quantmind,db,redis,celery-worker,celery-beat,huntly,rsshub,data-gateway,qwenpaw,host.docker.internal,.local,172.19.0.0/16,172.20.0.0/16}"
+      - "no_proxy=${QUANTMIND_DOCKER_NO_PROXY:-localhost,127.0.0.1,::1,quantmind,db,redis,celery-worker,celery-beat,huntly,rsshub,data-gateway,qwenpaw,host.docker.internal,.local,172.19.0.0/16,172.20.0.0/16}"
+
       # 安全配置
       - SECRET_KEY=${SECRET_KEY:-changeme-generate-a-random-secret}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-changeme-generate-a-random-secret}
