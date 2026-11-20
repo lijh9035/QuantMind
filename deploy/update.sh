@@ -286,6 +286,9 @@ build_core() {
     else
         # 签名未变 → 跳过
         log "2/5 跳过镜像构建（依赖/构建配置无变化；后端代码 bind mount 已生效）"
+        bash "$PROJECT_DIR/deploy/build-user-code-sandbox.sh" "$PROJECT_DIR" || {
+            die "因子沙箱镜像构建失败"
+        }
         return
     fi
 
@@ -298,6 +301,9 @@ build_core() {
             die "镜像构建失败，请检查以上日志"
         }
     fi
+    bash "$PROJECT_DIR/deploy/build-user-code-sandbox.sh" "$PROJECT_DIR" || {
+        die "因子沙箱镜像构建失败"
+    }
     # build 成功（或无需 build）才落盘新签名（失败不记录，下次重试）
     mkdir -p "$marker_dir"
     printf '%s' "$trigger" > "$marker"

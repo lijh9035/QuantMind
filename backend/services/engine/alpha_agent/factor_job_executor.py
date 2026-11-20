@@ -402,7 +402,7 @@ def execute_factor_backtest(
         raise RuntimeError("Fewer than 100 finite factor/return observations remain")
     factor_values = factor_values.iloc[np.flatnonzero(valid)]
     return_values = return_values.iloc[np.flatnonzero(valid)]
-    ic_mean, rank_ic_median, icir, observations = (
+    ic_mean, rank_ic_median, icir, _rank_icir, observations = (
         alpha_router._vectorized_daily_spearman_ic(factor_values, return_values)
     )
     if observations <= 0:

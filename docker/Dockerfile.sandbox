@@ -1,0 +1,13 @@
+ARG BASE_IMAGE=quantmind-oss:latest
+FROM ${BASE_IMAGE}
+
+# A dedicated, credential-free tag is required by the runtime image gate.
+# docker_runner supplies the actual security boundary at execution time.
+LABEL quantmind.user_code_sandbox="true"
+
+ENV SERVICE_MODE=sandbox
+
+# The core service health check and default server command are not relevant to
+# short-lived, isolated jobs.
+HEALTHCHECK NONE
+CMD ["python", "-c", "print('QuantMind user-code sandbox image is ready')"]

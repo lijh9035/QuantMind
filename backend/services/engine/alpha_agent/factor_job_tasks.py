@@ -14,6 +14,7 @@ from backend.services.engine.alpha_agent.factor_jobs import AlphaFactorJobPersis
 from backend.services.engine.qlib_app.celery_config import celery_app
 
 logger = logging.getLogger(__name__)
+_DISPATCHABLE_FACTOR_JOB_KINDS = ("materialize", "backtest", "validate")
 
 
 @celery_app.task(name="engine.tasks.dispatch_factor_job_outbox", max_retries=0)
@@ -33,9 +34,11 @@ def dispatch_factor_job_outbox() -> dict[str, int]:
         )
 
     jobs = AlphaFactorJobPersistence()
-    # This runner currently executes the materialization contract only. Keep
-    # other owner-scoped outbox kinds queued for their own executor.
-    claimed = _run_async(jobs.claim_outbox(limit=32, kind="materialize"))
+    # Keep cleanup/recovery and other owner-scoped work with their dedicated
+    # executors; materialization and single-factor backtest share this runner.
+    claimed = _run_async(
+        jobs.claim_outbox(limit=32, kinds=_DISPATCHABLE_FACTOR_JOB_KINDS)
+    )
     published = 0
     retried = 0
     for item in claimed:
@@ -108,6 +111,8 @@ def _run_factor_job(
         "doc_parse",
         "doc_organize",
         "materialize",
+        "backtest",
+        "validate",
     }:
         return {"job_id": job_id, "status": "stopping"}
 

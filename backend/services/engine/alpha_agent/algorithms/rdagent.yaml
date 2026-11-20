@@ -7,7 +7,7 @@ desc: >-
   LLM 多轮演化：假设 → 实验 → 编码 → 回测 → 反馈逐轮递进，产出可回测的
   因子表达式。演化轮数（loop_n）与数据集选择只对本算法生效。
 version: "quantmind-rd/1.0"
-enabled: true
+enabled: false
 tags: [llm, evolution]
 markets: [a_share]
 freqs: [day]

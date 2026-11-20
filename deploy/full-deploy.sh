@@ -564,6 +564,8 @@ build_and_start() {
         QM_REQ_SHA="${want:-unknown}" docker compose build --pull=false quantmind \
             || die "quantmind 镜像重建失败（$reason）。离线环境请重新生成与代码匹配的镜像包后重试"
     fi
+    bash "$PROJECT_DIR/deploy/build-user-code-sandbox.sh" "$PROJECT_DIR" \
+        || die "因子沙箱镜像构建失败"
     docker compose up -d --pull never
     configure_qwenpaw_runtime
     sync_qwenpaw_skills

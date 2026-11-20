@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from backend.shared.auth import get_internal_call_secret
+from backend.shared.container_witness import capture_container_identity
 from backend.shared.owner_scope import OwnerScope
 from backend.shared.secret_redaction import redact_text
 from backend.services.engine.alpha_agent.factor_job_budget import (
@@ -28,6 +29,7 @@ router = APIRouter(
 )
 _jobs = AlphaFactorJobPersistence()
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+_RUNNABLE_JOB_KINDS = {"materialize", "backtest", "validate"}
 
 
 class FactorJobRunRequest(BaseModel):
@@ -54,6 +56,32 @@ def _owner_from_internal_headers(request: Request) -> OwnerScope:
         raise HTTPException(
             status_code=400, detail="Owner context is required"
         ) from exc
+
+
+def _capture_engine_process_witness() -> dict[str, Any]:
+    from backend.shared.process_witness import capture_process
+
+    witness = capture_process()
+    client = None
+    try:
+        import docker
+
+        client = docker.from_env(timeout=5)
+        return capture_container_identity(
+            client, witness, allowed_services={"engine", "quantmind"}
+        )
+    except Exception as exc:  # noqa: BLE001 - recovery remains fail-closed
+        logger.warning(
+            "[factor-job-runner] Docker identity witness unavailable: %s",
+            type(exc).__name__,
+        )
+        return witness
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 async def _current_job(
@@ -298,7 +326,7 @@ async def run_factor_job(
     if (
         record.get("tenant_id") != owner.tenant_id
         or record.get("user_id") != owner.user_id
-        or record.get("kind") != "materialize"
+        or record.get("kind") not in _RUNNABLE_JOB_KINDS
         or record.get("execution_generation") != payload.execution_generation
     ):
         raise HTTPException(
@@ -315,8 +343,11 @@ async def run_factor_job(
             raise HTTPException(
                 status_code=409, detail="Factor job snapshot is invalid"
             ) from exc
+    job_kind = str(record.get("kind") or "")
     request_body = (
-        request_snapshot.get("request") if isinstance(request_snapshot, dict) else None
+        request_snapshot.get("request", request_snapshot)
+        if isinstance(request_snapshot, dict)
+        else None
     )
     if not isinstance(request_body, dict):
         raise HTTPException(status_code=409, detail="Factor job snapshot is invalid")
@@ -365,12 +396,12 @@ async def run_factor_job(
 
     from backend.services.engine.alpha_agent.factor_job_executor import (
         FactorMaterializationCancelled,
+        execute_factor_backtest,
         execute_factor_materialization,
     )
     from backend.services.engine.strategy_lab.runner.container_runner import (
         SandboxExecutionCancelled,
     )
-    from backend.shared.process_witness import capture_process
 
     request_id = uuid.uuid4().hex
     try:
@@ -380,7 +411,7 @@ async def run_factor_job(
             lease,
             dispatch_token=payload.dispatch_token,
             request_id=request_id,
-            engine_process=capture_process(),
+            engine_process=_capture_engine_process_witness(),
             execution_generation=payload.execution_generation,
         )
     except Exception as exc:
@@ -421,6 +452,10 @@ async def run_factor_job(
     stop_monitor = asyncio.Event()
 
     def thread_progress(snapshot: dict[str, Any]) -> None:
+        if cancel_event.is_set():
+            raise FactorMaterializationCancelled(
+                "Factor job cancellation was requested"
+            )
         future = asyncio.run_coroutine_threadsafe(
             _jobs.update_progress(
                 payload.job_id,
@@ -454,18 +489,23 @@ async def run_factor_job(
             stop_event=stop_monitor,
         )
     )
+    execute = (
+        execute_factor_materialization
+        if job_kind == "materialize"
+        else execute_factor_backtest
+    )
+    executor_kwargs: dict[str, Any] = {
+        "tenant_id": owner.tenant_id,
+        "user_id": owner.user_id,
+        "lease": lease,
+        "budget": budget,
+        "lifecycle": lifecycle,
+        "progress": thread_progress,
+    }
+    if job_kind == "materialize":
+        executor_kwargs["should_cancel"] = cancel_event.is_set
     operation = asyncio.create_task(
-        asyncio.to_thread(
-            execute_factor_materialization,
-            request_body,
-            tenant_id=owner.tenant_id,
-            user_id=owner.user_id,
-            lease=lease,
-            budget=budget,
-            lifecycle=lifecycle,
-            progress=thread_progress,
-            should_cancel=cancel_event.is_set,
-        )
+        asyncio.to_thread(execute, request_body, **executor_kwargs)
     )
     result: dict[str, Any] | None = None
     execution_error: Exception | None = None

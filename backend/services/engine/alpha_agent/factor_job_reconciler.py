@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import socket
 from typing import Any
 
 from sqlalchemy import text
@@ -14,12 +16,111 @@ from backend.shared.process_witness import capture_process
 from backend.shared.container_witness import container_namespace_has_stopped
 
 logger = logging.getLogger(__name__)
+_ENGINE_SERVICES = {"engine", "quantmind"}
 
 
-def _engine_has_stopped(client, witness):
-    return process_has_stopped(witness) or container_namespace_has_stopped(
-        client, witness
-    )
+def _local_engine_identity(client, daemon_id: str) -> dict[str, str] | None:
+    """Identify the Compose engine that owns this reconciler's Docker socket."""
+    host = socket.gethostname()
+    if not re.fullmatch(r"[0-9a-f]{12,64}", host):
+        return None
+    try:
+        container = client.containers.get(host)
+        container.reload()
+        attrs = getattr(container, "attrs", {}) or {}
+        config = attrs.get("Config", {}) or {}
+        labels = config.get("Labels", {}) or {}
+        service = labels.get("com.docker.compose.service")
+        project = labels.get("com.docker.compose.project")
+        container_id = str(getattr(container, "id", ""))
+        if (
+            not container_id.startswith(host)
+            or config.get("Hostname") != host
+            or service not in _ENGINE_SERVICES
+            or not project
+            or not daemon_id
+        ):
+            return None
+        return {
+            "container_id": container_id,
+            "daemon_id": daemon_id,
+            "project": str(project),
+            "service": str(service),
+        }
+    except Exception:
+        return None
+
+
+def _engine_has_stopped(client, witness, *, daemon_id="", local_identity=None):
+    if process_has_stopped(witness):
+        return True
+    if not isinstance(witness, dict) or not local_identity:
+        return False
+    host = witness.get("host", "")
+    if (
+        not isinstance(host, str)
+        or not re.fullmatch(r"[0-9a-f]{12,64}", host)
+        or not re.fullmatch(r"pid:\[\d+\]", str(witness.get("pid_namespace", "")))
+        or not re.fullmatch(r"[0-9a-f-]{36}", str(witness.get("boot_id") or ""))
+        or type(witness.get("pid")) is not int
+        or witness["pid"] <= 0
+        or not re.fullmatch(r"\d+", str(witness.get("start_ticks", "")))
+    ):
+        return False
+    expected_daemon = witness.get("docker_daemon_id")
+    expected_project = witness.get("compose_project")
+    expected_service = witness.get("compose_service")
+    if expected_daemon and expected_daemon != daemon_id:
+        return False
+    if expected_project and expected_project != local_identity["project"]:
+        return False
+    if expected_service and expected_service not in _ENGINE_SERVICES:
+        return False
+    container_id = witness.get("container_id") or host
+    if not isinstance(container_id, str):
+        return False
+    if len(container_id) != len(host) and not re.fullmatch(
+        r"[0-9a-f]{64}", container_id
+    ):
+        return False
+    if len(container_id) == 64 and not container_id.startswith(host):
+        return False
+    try:
+        container = client.containers.get(container_id)
+    except Exception as exc:
+        from docker.errors import NotFound
+
+        if isinstance(exc, NotFound):
+            # The reconciler has verified its Compose project and daemon. This
+            # job has no foreign execution-node binding, so the old engine
+            # container's absence proves its PID namespace has ended.
+            return not expected_daemon or expected_daemon == daemon_id
+        return False
+    try:
+        container.reload()
+        attrs = getattr(container, "attrs", {}) or {}
+        config = attrs.get("Config", {}) or {}
+        labels = config.get("Labels", {}) or {}
+        service = labels.get("com.docker.compose.service")
+        project = labels.get("com.docker.compose.project")
+        if (
+            not str(getattr(container, "id", "")).startswith(host)
+            or config.get("Hostname") != host
+            or service not in _ENGINE_SERVICES
+            or project != local_identity["project"]
+            or (expected_service and service != expected_service)
+        ):
+            return False
+        enriched = {
+            **witness,
+            "container_id": str(container.id),
+            "docker_daemon_id": daemon_id,
+            "compose_project": str(project),
+            "compose_service": str(service),
+        }
+        return container_namespace_has_stopped(client, enriched)
+    except Exception:
+        return False
 
 
 def _node_rebooted(executor):
@@ -96,7 +197,11 @@ def _stop_owned_container(
 
 
 def _stop_and_remove_artifacts(
-    client: Any, candidate: dict[str, Any], daemon_id: str
+    client: Any,
+    candidate: dict[str, Any],
+    daemon_id: str,
+    *,
+    local_identity: dict[str, str] | None = None,
 ) -> bool:
     executor = candidate.get("executor") or {}
     if executor.get("daemon_id") != daemon_id:
@@ -129,7 +234,15 @@ def _stop_and_remove_artifacts(
         or not dispatch_token
         or type(generation) is not int
         or generation <= 0
-        or not (_engine_has_stopped(client, engine_process) or _node_rebooted(executor))
+        or not (
+            _engine_has_stopped(
+                client,
+                engine_process,
+                daemon_id=daemon_id,
+                local_identity=local_identity,
+            )
+            or _node_rebooted(executor)
+        )
     ):
         return False
 
@@ -181,7 +294,12 @@ def _stop_and_remove_artifacts(
             logger.warning(
                 "Stopped factor output volume awaits cleanup: %s", volume_name
             )
-    return _engine_has_stopped(client, engine_process) or _node_rebooted(executor)
+    return _engine_has_stopped(
+        client,
+        engine_process,
+        daemon_id=daemon_id,
+        local_identity=local_identity,
+    ) or _node_rebooted(executor)
 
 
 def _is_local_cleanup(
@@ -216,7 +334,7 @@ def _is_local_cleanup(
                 "generation": executor.get("execution_generation"),
             },
         ).scalar_one_or_none() in (
-            {"pool_research", "purge", "purge_task"}
+            {"pool_research", "purge", "purge_task", "backtest", "validate"}
             if finished_only
             else {
                 "cleanup",
@@ -226,6 +344,8 @@ def _is_local_cleanup(
                 "purge_task",
                 "materialize",
                 "serve_features",
+                "backtest",
+                "validate",
             }
         )
 
@@ -240,6 +360,7 @@ def reconcile_orphaned_factor_jobs(client: Any) -> int:
     daemon_id = str(client.info().get("ID") or "")
     if not daemon_id:
         raise RuntimeError("Docker daemon identity is unavailable")
+    local_identity = _local_engine_identity(client, daemon_id)
     recovered = 0
     for candidate in budget.store.engine_execution_candidates(POOL):
         executor = candidate.get("executor") or {}
@@ -253,7 +374,13 @@ def reconcile_orphaned_factor_jobs(client: Any) -> int:
         try:
             local_cleanup = False
             if not (
-                _engine_has_stopped(client, engine_process) or _node_rebooted(executor)
+                _engine_has_stopped(
+                    client,
+                    engine_process,
+                    daemon_id=daemon_id,
+                    local_identity=local_identity,
+                )
+                or _node_rebooted(executor)
             ):
                 if executor.get("engine_request_state") != "finished":
                     continue
@@ -262,7 +389,7 @@ def reconcile_orphaned_factor_jobs(client: Any) -> int:
                     continue
             local_cleanup = local_cleanup or _is_local_cleanup(budget, candidate)
             if not local_cleanup and not _stop_and_remove_artifacts(
-                client, candidate, daemon_id
+                client, candidate, daemon_id, local_identity=local_identity
             ):
                 continue
 
@@ -286,6 +413,8 @@ def reconcile_orphaned_factor_jobs(client: Any) -> int:
                         "WHEN :cleanup AND kind='purge' THEN 'OwnerPurgeInterrupted' "
                         "WHEN :cleanup AND kind='purge_task' THEN 'OwnerTaskPurgeInterrupted' "
                         "WHEN :cleanup AND kind='materialize' THEN 'FactorMaterializationInterrupted' "
+                        "WHEN :cleanup AND kind='backtest' THEN 'FactorBacktestInterrupted' "
+                        "WHEN :cleanup AND kind='validate' THEN 'FactorValidationInterrupted' "
                         "WHEN :cleanup AND kind='serve_features' THEN 'FactorServingInterrupted' "
                         "WHEN :cleanup THEN 'FactorRecoveryInterrupted' ELSE error_code END,"
                         "error_message=CASE WHEN :cleanup AND kind='cleanup' THEN '清理进程已退出；可重新预览剩余文件后提交清理' "
@@ -293,13 +422,15 @@ def reconcile_orphaned_factor_jobs(client: Any) -> int:
                         "WHEN :cleanup AND kind='purge' THEN '清空挖掘数据进程已退出；可重新预览后提交清理' "
                         "WHEN :cleanup AND kind='purge_task' THEN '单任务清理进程已退出；可重新预览后提交清理' "
                         "WHEN :cleanup AND kind='materialize' THEN '因子物化进程已退出；该 generation 未发布，可重新提交物化' "
+                        "WHEN :cleanup AND kind='backtest' THEN '单因子回测进程已退出；可重新提交回测' "
+                        "WHEN :cleanup AND kind='validate' THEN '因子验证进程已退出；可重新提交验证' "
                         "WHEN :cleanup AND kind='serve_features' THEN '因子供数进程已退出；训练 generation 保持不变' "
                         "WHEN :cleanup THEN '恢复进程已退出；已保存的代码版本保留，请核对历史后重新提交' ELSE error_message END "
                         "WHERE job_id=:job "
                         "AND tenant_id=:tenant AND user_id=:user "
                         "AND execution_generation=:generation "
                         "AND status IN ('running','stopping')"
-                        " AND (NOT :cleanup OR kind IN ('cleanup','recovery','pool_research','purge','purge_task','materialize','serve_features'))"
+                        " AND (NOT :cleanup OR kind IN ('cleanup','recovery','pool_research','purge','purge_task','materialize','serve_features','backtest','validate'))"
                     ),
                     {
                         "status": status,

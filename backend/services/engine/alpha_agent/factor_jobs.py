@@ -251,25 +251,22 @@ def _record_materialization_outcome(
     write time, so quota and memory reads stay single-table and owner-filtered;
     a factor without a traceable task records an empty direction.
     """
-    direction_row = (
-        session.execute(
-            text(
-                "SELECT left(COALESCE(t.direction,''),2000) AS direction "
-                "FROM rd_agent_factors f "
-                "LEFT JOIN alpha_mining_tasks t "
-                "ON t.tenant_id=f.tenant_id AND t.user_id=f.user_id "
-                "AND t.task_id=f.metadata_json->>'task_id' "
-                "WHERE f.tenant_id=:tenant AND f.user_id=:user "
-                "AND f.factor_id=:factor LIMIT 1"
-            ),
-            {
-                "tenant": owner.tenant_id,
-                "user": owner.user_id,
-                "factor": request_body.get("factor_id"),
-            },
-        )
-        .first()
-    )
+    direction_row = session.execute(
+        text(
+            "SELECT left(COALESCE(t.direction,''),2000) AS direction "
+            "FROM rd_agent_factors f "
+            "LEFT JOIN alpha_mining_tasks t "
+            "ON t.tenant_id=f.tenant_id AND t.user_id=f.user_id "
+            "AND t.task_id=f.metadata_json->>'task_id' "
+            "WHERE f.tenant_id=:tenant AND f.user_id=:user "
+            "AND f.factor_id=:factor LIMIT 1"
+        ),
+        {
+            "tenant": owner.tenant_id,
+            "user": owner.user_id,
+            "factor": request_body.get("factor_id"),
+        },
+    ).first()
     session.execute(
         text(
             "INSERT INTO alpha_factor_materializations "
@@ -948,18 +945,41 @@ class AlphaFactorJobPersistence:
             return dict(row) if row else None
 
     async def claim_outbox(
-        self, *, limit: int = 32, kind: str | None = None
+        self,
+        *,
+        limit: int = 32,
+        kind: str | None = None,
+        kinds: tuple[str, ...] | list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Lease a bounded, optionally kind-scoped batch of durable events."""
         if not 1 <= limit <= 128:
             raise ValueError("Factor job dispatch batch is out of range")
         if kind is not None and (not isinstance(kind, str) or not kind.strip()):
             raise ValueError("Factor job dispatch kind is invalid")
+        if kind is not None and kinds is not None:
+            raise ValueError("Specify either one factor job kind or a kind set")
         claimed: list[dict[str, str]] = []
         kind_filter = " AND job.kind=:kind" if kind is not None else ""
         params: dict[str, Any] = {"limit": limit}
         if kind is not None:
             params["kind"] = kind.strip()
+        if kinds is not None:
+            if (
+                not isinstance(kinds, (tuple, list))
+                or not kinds
+                or len(kinds) > 16
+                or any(
+                    not isinstance(value, str) or not value.strip() for value in kinds
+                )
+            ):
+                raise ValueError("Factor job dispatch kinds are invalid")
+            normalized_kinds = tuple(dict.fromkeys(value.strip() for value in kinds))
+            placeholders = []
+            for index, value in enumerate(normalized_kinds):
+                name = f"kind_{index}"
+                placeholders.append(f":{name}")
+                params[name] = value
+            kind_filter = f" AND job.kind IN ({', '.join(placeholders)})"
         async with get_session() as session:
             rows = await session.execute(
                 text(
@@ -1453,13 +1473,14 @@ class AlphaFactorJobPersistence:
                     generation_id = request_body.get("generation_id")
                     if not isinstance(generation_id, str) or not generation_id:
                         raise ValueError("Factor materialization generation is missing")
-                    if status == "completed" and isinstance(
-                        result, dict
-                    ) and result.get("status") == "rejected_duplicate":
+                    if (
+                        status == "completed"
+                        and isinstance(result, dict)
+                        and result.get("status") == "rejected_duplicate"
+                    ):
                         if (
                             result.get("generation_id") != generation_id
-                            or result.get("factor_id")
-                            != request_body.get("factor_id")
+                            or result.get("factor_id") != request_body.get("factor_id")
                             or result.get("factor_revision_no")
                             != request_body.get("factor_revision_no")
                             or result.get("factor_code_sha256")
@@ -1513,7 +1534,10 @@ class AlphaFactorJobPersistence:
                             evidence=result["evidence"],
                         )
                     elif status == "completed":
-                        if isinstance(result, dict) and result.get("status") == "replaced":
+                        if (
+                            isinstance(result, dict)
+                            and result.get("status") == "replaced"
+                        ):
                             from backend.services.engine.alpha_agent.factor_materialize_gate import (
                                 REPLACE_IC_FLOOR,
                                 REPLACE_IC_RATIO,
@@ -1528,7 +1552,9 @@ class AlphaFactorJobPersistence:
                             new_ic = result.get("new_ic")
                             incumbent_ic = result.get("incumbent_ic")
                             if (
-                                not isinstance(result.get("replaced_generation_id"), str)
+                                not isinstance(
+                                    result.get("replaced_generation_id"), str
+                                )
                                 or not result["replaced_generation_id"]
                                 or len(result["replaced_generation_id"]) > 64
                                 or result["replaced_generation_id"] == generation_id
@@ -1633,7 +1659,8 @@ class AlphaFactorJobPersistence:
                                             "start_date",
                                             "end_date",
                                         )
-                                    } | {"input_evidence": result.get("input_evidence")},
+                                    }
+                                    | {"input_evidence": result.get("input_evidence")},
                                     sort_keys=True,
                                     ensure_ascii=False,
                                     separators=(",", ":"),
