@@ -52,6 +52,9 @@ _HOP_HEADERS = {
     "content-length",
 }
 
+# Local session credentials must never be forwarded to the QuantDB service.
+_LOCAL_AUTH_HEADERS = {"authorization", "cookie"}
+
 # 远端只接受 gzip 压缩的模型包
 _UPLOAD_CONTENT_TYPE = "application/gzip"
 
@@ -79,7 +82,11 @@ class ImportRemoteRequest(BaseModel):
 
 
 def _forward_headers(request: Request) -> dict[str, str]:
-    return {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS}
+    return {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in _HOP_HEADERS | _LOCAL_AUTH_HEADERS
+    }
 
 
 def _require_api_key() -> str:
@@ -90,6 +97,14 @@ def _require_api_key() -> str:
             detail="QUANTDB_API_KEY 未配置，无法访问模型广场。请在「个人中心 → 数据平台 QuantDB」中配置 API Key。",
         )
     return api_key
+
+
+def _is_public_model_catalog_read(method: str, path: str) -> bool:
+    """Model listing and public model details are readable without a QuantDB key."""
+    if method.upper() != "GET":
+        return False
+    parts = [part for part in path.strip("/").split("/") if part]
+    return len(parts) in {1, 2} and parts[0] == "models"
 
 
 def _build_model_archive(model_dir: Path) -> bytes:
@@ -957,15 +972,14 @@ async def import_remote_model(
     "/api/v1/hub/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"]
 )
 async def proxy_model_hub(path: str, request: Request):
-    api_key = _require_api_key()
-
     upstream_url = f"{HUB_BASE_URL}/api/v1/hub/{path}"
     if request.url.query:
         upstream_url += f"?{request.url.query}"
 
     method = request.method.upper()
     headers = _forward_headers(request)
-    headers["X-API-Key"] = api_key
+    if not _is_public_model_catalog_read(method, path):
+        headers["X-API-Key"] = _require_api_key()
     body = await request.body()
 
     timeout = httpx.Timeout(connect=5.0, read=60.0, write=60.0, pool=10.0)
