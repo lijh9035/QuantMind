@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Dict
+from typing import Any
 
 from rdagent.components.coder.CoSTEER.evaluators import CoSTEERSingleFeedback
 from rdagent.components.coder.CoSTEER.evolving_strategy import (
@@ -15,7 +15,6 @@ from rdagent.components.coder.CoSTEER.knowledge_management import (
 from rdagent.components.coder.factor_coder.config import FACTOR_COSTEER_SETTINGS
 from rdagent.components.coder.factor_coder.factor import FactorFBWorkspace, FactorTask
 from rdagent.core.experiment import FBWorkspace
-from rdagent.oai.llm_conf import LLM_SETTINGS
 from rdagent.oai.llm_utils import APIBackend
 from rdagent.utils.agent.tpl import T
 
@@ -143,11 +142,18 @@ class FactorMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
                     user_prompt=user_prompt,
                     system_prompt=system_prompt,
                     json_mode=True,
-                    json_target_type=Dict[str, str],
+                    # The model may add commentary fields (for example
+                    # ``"feedback": null``). Only ``code`` is consumed below;
+                    # validating every arbitrary object value as ``str`` makes
+                    # harmless extra fields fail the entire coding round.
+                    json_target_type=dict[str, Any],
                 )
 
                 try:
-                    code = json.loads(response)["code"]
+                    payload = json.loads(response)
+                    code = payload["code"]
+                    if not isinstance(code, str) or not code.strip():
+                        raise ValueError("Factor coder response has no code string")
                 except json.decoder.JSONDecodeError:
                     # extract python code block
                     match = re.search(r"```python(.*?)```", response, re.DOTALL)
@@ -155,10 +161,12 @@ class FactorMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
                         code = match.group(1).strip()
                     else:
                         raise  # continue to retry
+                except (KeyError, ValueError):
+                    continue
 
                 return code
 
-            except (json.decoder.JSONDecodeError, KeyError):
+            except json.decoder.JSONDecodeError:
                 pass
         else:
             return ""  # return empty code if failed to get code after 10 attempts

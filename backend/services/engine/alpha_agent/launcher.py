@@ -504,7 +504,14 @@ class AlphaAgentLauncher:
 
             await run_alphasage_queued(record)
             return
-        if algorithm not in {"rdagent", "statistical"}:
+        if algorithm == "statistical":
+            from backend.services.engine.alpha_agent.statistical.runner import (
+                run_statistical_queued,
+            )
+
+            await run_statistical_queued(record)
+            return
+        if algorithm != "rdagent":
             raise ValueError(f"Unsupported persisted mining algorithm: {algorithm}")
         from backend.shared.owner_scope import OwnerScope
 
@@ -801,6 +808,9 @@ class AlphaAgentLauncher:
                     if task.status == TaskStatus.RUNNING:
                         task.status = TaskStatus.FAILED
                         task.error_message = "Server restarted while task was running"
+                        task.phase = "failed"
+                        task.progress = "服务重启时任务进程已中断"
+                        self._persist_task(task)
                     self._tasks[task.task_id] = task
                 except Exception as e:
                     logger.warning("Failed to load task from %s: %s", state_file, e)

@@ -1412,7 +1412,14 @@ class AlphaMiningTaskPersistence:
                         "data_source,date_range) VALUES (:factor_id,:factor_name,:factor_code,"
                         "'pending',:user_id,:tenant_id,CAST(:metadata AS jsonb),:market,"
                         ":universe,:rank_ic,:rank_ic,:factor_formulation,:data_source,:date_range) "
-                        "ON CONFLICT (factor_id) DO NOTHING"
+                        "ON CONFLICT (factor_id) DO UPDATE SET "
+                        "factor_name=EXCLUDED.factor_name, factor_code=EXCLUDED.factor_code, "
+                        "metadata_json=EXCLUDED.metadata_json, market=EXCLUDED.market, "
+                        "universe=EXCLUDED.universe, rank_ic=EXCLUDED.rank_ic, "
+                        "ic_value=EXCLUDED.ic_value, factor_formulation=EXCLUDED.factor_formulation, "
+                        "data_source=EXCLUDED.data_source, date_range=EXCLUDED.date_range, "
+                        "updated_at=now() WHERE rd_agent_factors.tenant_id=EXCLUDED.tenant_id "
+                        "AND rd_agent_factors.user_id=EXCLUDED.user_id"
                     ),
                     {
                         **owner.sql_params(),

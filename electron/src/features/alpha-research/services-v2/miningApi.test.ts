@@ -37,7 +37,7 @@ describe('factor mining API', () => {
 
     expect(client.post).toHaveBeenCalledTimes(1);
     const [url, body, config] = client.post.mock.calls[0];
-    expect(url).toBe('/alpha-agent/evolve');
+    expect(url).toBe('/alpha-agent/mining/submit');
     expect(body).toEqual({
       algorithm: 'statistical',
       market: 'a_share',
@@ -48,7 +48,7 @@ describe('factor mining API', () => {
       mining_end: '2022-12-31',
       valid_start: '2023-01-01',
       valid_end: '2023-12-31',
-      auto_materialize: true,
+      auto_materialize: false,
     });
     expect(config.headers['Idempotency-Key']).toEqual(expect.any(String));
     expect(config.headers['Idempotency-Key'].length).toBeGreaterThan(0);

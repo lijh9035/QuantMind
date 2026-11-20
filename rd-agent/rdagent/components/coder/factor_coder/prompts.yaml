@@ -49,6 +49,8 @@ evolving_strategy_factor_implementation_v1_system: |-
   
   Your must write your code based on your former latest attempt below which consists of your former code and code feedback, you should read the former attempt carefully and must not modify the right part of your former code.
 
+  The daily_pv.h5 DataFrame uses literal Qlib column names with a leading dollar sign, such as "$open", "$high", "$low", "$close", "$volume", "$amount", and "$factor". Keep that prefix when accessing columns (for example, df["$high"]); do not assume unprefixed columns such as "high" or "low" exist.
+
   Notice that you should not add any other text before or after the json format.
 
   {% if queried_former_failed_knowledge|length != 0 %}

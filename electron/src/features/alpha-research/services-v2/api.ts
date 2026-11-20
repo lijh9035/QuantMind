@@ -300,7 +300,7 @@ function miningRequestBody(params: MiningStartParams) {
       mining_end: params.miningEnd,
       valid_start: params.validStart,
       valid_end: params.validEnd,
-      auto_materialize: params.autoMaterialize ?? true,
+      auto_materialize: false,
     };
   }
   return {
@@ -376,7 +376,7 @@ export async function startMining(
   requestKey: string,
   signal?: AbortSignal,
 ): Promise<ApiResponse<{ taskId: string; task: Task }>> {
-  const submitPath = params.algorithm === 'alphasage'
+  const submitPath = params.algorithm === 'alphasage' || params.algorithm === 'statistical'
     ? '/alpha-agent/mining/submit'
     : '/alpha-agent/evolve';
   const res = await apiClient.post(submitPath, miningRequestBody(params), {

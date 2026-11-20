@@ -176,9 +176,13 @@ def get_data_folder_intro(fname_reg: str = ".*", flags=0, variable_mapping=None)
 HDF5 Data File containing daily stock price/volume data for A-share market.
 
 ## Content Overview
-Contains daily OHLCV data (open, close, high, low, volume, factor) for all A-share stocks from 2008 onwards.
+Contains daily OHLCV data for A-share stocks. The stored columns use Qlib's literal
+names: ``$open``, ``$high``, ``$low``, ``$close``, ``$volume``, ``$amount`` and
+``$factor`` (plus any available enriched columns such as ``$rsi_14``).
 Data is stored in HDF5 format with MultiIndex (datetime, instrument).
 This data is sourced from Qlib's cn_data provider and used for factor evaluation.
+When reading the DataFrame, keep the ``$`` prefix, for example ``df["$high"]``;
+``df["high"]`` is a different, missing column.
 """
     # generate_data_folder_from_qlib()  # Disabled - data already available via Qlib
     content_l = []

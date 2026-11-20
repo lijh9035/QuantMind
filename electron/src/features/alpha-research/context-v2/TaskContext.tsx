@@ -214,7 +214,7 @@ function resolveMiningParams(config: TaskConfig): MiningStartParams {
     algorithm: config.algorithm ?? 'rdagent',
     statisticalConfig: config.algorithm === 'statistical' ? config.statisticalConfig : undefined,
     alphaSageConfig: config.algorithm === 'alphasage' ? config.alphaSageConfig : undefined,
-    autoMaterialize: config.algorithm === 'statistical' ? config.autoMaterialize ?? true : false,
+    autoMaterialize: config.algorithm === 'statistical' ? config.autoMaterialize ?? false : false,
     miningStart: config.miningStart,
     miningEnd: config.miningEnd,
     validStart: config.validStart,

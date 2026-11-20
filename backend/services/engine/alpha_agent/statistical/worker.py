@@ -139,25 +139,36 @@ def _prepare_snapshot(
         progress_path,
         {"stage": "snapshot", "detail": "冻结行情与元数据输入", "progress_pct": 5},
     )
+    print("[snapshot] 冻结行情与元数据输入", flush=True)
     from backend.services.engine.alpha_agent.quantdb_price_panel import (
         load_factor_price_panel,
     )
 
     if snapshot.get("price_source") == "quantdb_daily_forward":
-        frozen_symbols = symbols if symbols is not None else panel.qlib_instruments(
-            universe, qlib_dir=qlib_dir
+        frozen_symbols = (
+            symbols
+            if symbols is not None
+            else panel.qlib_instruments(universe, qlib_dir=qlib_dir)
         )
         prices = load_factor_price_panel(
-            frozen_symbols, anchor.strftime("%Y-%m-%d"),
-            fetch_end.strftime("%Y-%m-%d"), warmup_bars=warmup,
+            frozen_symbols,
+            anchor.strftime("%Y-%m-%d"),
+            fetch_end.strftime("%Y-%m-%d"),
+            warmup_bars=warmup,
         )
         price_panel = panel.normalize_panel(prices)
     else:
-        calendar = panel.qlib_calendar("1900-01-01", fetch_end.strftime("%Y-%m-%d"), qlib_dir=qlib_dir)
+        calendar = panel.qlib_calendar(
+            "1900-01-01", fetch_end.strftime("%Y-%m-%d"), qlib_dir=qlib_dir
+        )
         price_panel = panel.load_price_panel(
-            anchor.strftime("%Y-%m-%d"), fetch_end.strftime("%Y-%m-%d"),
-            market=universe, symbols=symbols, warmup_bars=warmup,
-            qlib_dir=qlib_dir, calendar=calendar,
+            anchor.strftime("%Y-%m-%d"),
+            fetch_end.strftime("%Y-%m-%d"),
+            market=universe,
+            symbols=symbols,
+            warmup_bars=warmup,
+            qlib_dir=qlib_dir,
+            calendar=calendar,
         )
     metadata = panel.load_symbol_metadata()
     task_dir = request_path.resolve().parent
@@ -227,6 +238,7 @@ _TASK_ENVELOPE_PARAMS = frozenset(
         "loop_n",
         "direction",
         "auto_materialize",
+        "freq",
     }
 )
 
@@ -360,6 +372,7 @@ def run(request_path: Path, result_path: Path, progress_path: Path) -> None:
                 "progress_pct": _STAGE_PROGRESS.get(str(stage), 5),
             },
         )
+        print(f"[{str(stage)[:64]}] {str(detail)[:1000]}", flush=True)
 
     from .variant_ledger import frozen_cooled_keys
 
